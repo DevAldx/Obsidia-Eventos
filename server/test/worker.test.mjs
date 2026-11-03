@@ -392,3 +392,33 @@ test("panel web: sin ADMIN_PASSWORD no se puede entrar", async () => {
   const res = await call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: "" }) });
   assert.equal(res.status, 503);
 });
+
+test("panel web: crear un pack con mods y leerlo para editarlo", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+  const login = await call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: "contraseña-larga-de-prueba" }) });
+  const { token } = await login.json();
+
+  // Un .jar propio subido desde la web y otro de Modrinth.
+  const jar = new TextEncoder().encode("jar privado");
+  assert.equal((await upload(env, token, jar)).status, 201);
+  const m = manifest(`${ORIGIN}/files/${sha1(jar)}`, sha1(jar), jar.byteLength);
+  m.mods.push({ file_name: "sodium.jar", url: "https://cdn.modrinth.com/data/AANobbMI/x/sodium.jar", sha1: "b".repeat(40), size: 9, title: "Sodium", project_id: "AANobbMI" });
+  const created = await post(env, "/api/packs", token, m);
+  assert.equal(created.status, 201, await created.clone().text());
+  const { code } = await created.json();
+
+  const got = await call(env, "GET", `/api/admin/packs/${code}`, { token });
+  assert.equal(got.status, 200);
+  const pack = await got.json();
+  assert.equal(pack.mods.length, 2);
+  assert.equal(pack.mods[1].project_id, "AANobbMI", "guarda los datos extra para mostrarlos");
+  assert.equal((await call(env, "GET", `/api/admin/packs/${code}`, { token: await tokenOf(env, PLAYER) })).status, 403);
+  assert.equal((await call(env, "GET", "/api/admin/packs/OBS-ZZZZZZ", { token })).status, 404);
+
+  const ev = await (await post(env, "/api/admin/events", token, { name: "Con mods", pack_code: code })).json();
+  assert.equal(ev.loader, "fabric");
+  // Mientras el evento lo usa no se puede borrar; después sí.
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token })).status, 409);
+  await call(env, "PUT", `/api/admin/events/${ev.id}`, { token, body: JSON.stringify({ name: "Con mods", minecraft_version: "1.21.1" }) });
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token })).status, 204);
+});

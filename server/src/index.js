@@ -28,6 +28,7 @@ import { ADMIN_HTML, ADMIN_JS } from "./admin-page.js";
 //   GET  /admin                                  la página del panel
 //   POST /api/admin/web-login    { password }    -> { token } sesión web de admin (12 h)
 //   GET  /api/admin/resolve?q=<nombre|uuid>      -> { uuid, name } (admin)
+//   GET  /api/admin/packs/<OBS-XXXXXX>           el manifiesto de un pack (admin)
 //
 // Servidor de Minecraft (clave SERVER_KEY):
 //   GET  /api/server/<EVT-XXXXXX>/whitelist.json  la whitelist en el formato de Minecraft
@@ -194,6 +195,8 @@ async function route(request, env) {
 
   m = path.match(/^\/api\/packs\/(OBS-[A-Z0-9]{6})$/);
   if (m && method === "DELETE") return deletePack(request, env, m[1]);
+  m = path.match(/^\/api\/admin\/packs\/(OBS-[A-Z0-9]{6})$/);
+  if (m && method === "GET") return adminGetPack(request, env, m[1]);
 
   if (path === "/api/admin/events" && method === "GET") return adminListEvents(request, env);
   if (path === "/api/admin/events" && method === "POST") return adminSaveEvent(request, env, null);
@@ -471,6 +474,14 @@ async function deletePack(request, env, code) {
   return new Response(null, { status: 204 });
 }
 
+/** El manifiesto completo de un pack (para editar sus mods desde el panel web). */
+async function adminGetPack(request, env, code) {
+  await requireAdmin(request, env);
+  const pack = await readPack(env, code);
+  if (!pack) throw new HttpError(404, "no existe ningún pack con ese código");
+  return json(pack, 200, { "cache-control": "no-store" });
+}
+
 // ───────────────────────────── Administradores ─────────────────────────────
 
 function isAdmin(env, uuid) {
@@ -730,7 +741,7 @@ async function adminRemovePlayer(request, env, id, rawUuid) {
 // ───────────────────────────── Panel web ─────────────────────────────
 
 const PAGE_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self' https://meta.fabricmc.net; img-src 'self' data:; " +
+  "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self' https://meta.fabricmc.net https://api.modrinth.com; img-src 'self' data: https://cdn.modrinth.com; " +
   "form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 function page(body, type) {

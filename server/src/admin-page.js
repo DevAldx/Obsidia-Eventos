@@ -77,6 +77,25 @@ export const ADMIN_HTML = `<!doctype html>
   .x { width: 28px; height: 28px; border-radius: 7px; border: none; background: none; color: var(--muted); cursor: pointer; font-size: 15px; }
   .x:hover { background: rgb(255 80 80 / .12); color: var(--danger); }
   .filter { margin-top: 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .mods { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--border); }
+  .mods .card-head { margin-bottom: 8px; }
+  ul.modlist, ul.results { list-style: none; margin: 10px 0 0; padding: 0; }
+  ul.modlist { border: 1px solid var(--border); border-radius: var(--radius); max-height: 420px; overflow-y: auto; }
+  ul.modlist:empty { display: none; }
+  ul.modlist li, ul.results li { display: flex; align-items: center; gap: 12px; padding: 8px 12px; }
+  ul.modlist li { border-bottom: 1px solid var(--border); }
+  ul.modlist li:last-child { border-bottom: none; }
+  ul.results li { border-radius: 8px; }
+  ul.results li:hover { background: var(--surface-2); }
+  .ic { width: 32px; height: 32px; border-radius: 7px; background: var(--surface-2); flex: none; object-fit: cover; }
+  .m-main { flex: 1; min-width: 0; }
+  .m-main strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .m-main span { display: block; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .src { font-size: 11px; padding: 1px 7px; border-radius: 6px; background: var(--surface-2); color: var(--muted); flex: none; }
+  .src.dep { color: var(--accent-hover); }
+  .search { margin-top: 12px; }
+  .actions { align-items: center; }
   .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 10; max-width: calc(100vw - 32px); }
   .toast { padding: 10px 14px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border-strong); white-space: pre-line; max-width: 420px; }
   .toast.err { border-color: #6b2b2b; color: var(--danger); }
@@ -136,12 +155,11 @@ export const ADMIN_HTML = `<!doctype html>
             <label class="field wide">Nombre <input name="name" maxlength="48" required placeholder="Torneo de invierno"></label>
             <label class="field wide">Descripción <span class="hint">(opcional)</span><textarea name="description" maxlength="600" rows="3"></textarea></label>
             <label class="field">Servidor de Minecraft <input name="server_address" class="mono" placeholder="mc.tuservidor.com:25565"></label>
-            <label class="field">Pack del evento <span class="hint">(opcional)</span><input name="pack_code" class="mono" maxlength="10" placeholder="OBS-XXXXXX"></label>
-            <label class="field nopack">Versión de Minecraft <input name="minecraft_version" class="mono" value="1.21.1"></label>
-            <label class="field nopack">Loader
+            <label class="field">Versión de Minecraft <input name="minecraft_version" class="mono" value="1.21.1"></label>
+            <label class="field">Loader
               <select name="loader"><option value="vanilla">Vanilla</option><option value="fabric">Fabric</option></select>
             </label>
-            <label class="field nopack fabric-only">Versión de Fabric Loader <span class="hint" id="fabric-hint"></span>
+            <label class="field fabric-only">Versión de Fabric Loader <span class="hint" id="fabric-hint"></span>
               <input name="loader_version" class="mono" placeholder="0.16.5" list="fabric-versions">
               <datalist id="fabric-versions"></datalist>
             </label>
@@ -149,7 +167,27 @@ export const ADMIN_HTML = `<!doctype html>
             <label class="field wide">Imagen <span class="hint">(https, opcional)</span><input name="image_url" class="mono" placeholder="https://…/portada.jpg"></label>
             <label class="check wide"><input type="checkbox" name="active" checked> Abierto: los jugadores de la whitelist lo ven y pueden jugar</label>
           </div>
-          <div class="actions"><button class="btn primary" type="submit" id="save">Crear evento</button></div>
+          <section class="mods" id="mods-section">
+            <div class="card-head">
+              <div><p class="eyebrow">Mods</p><h3 id="mods-count">Sin mods</h3></div>
+              <div class="row">
+                <button class="btn sm" type="button" id="update-mods" hidden>Actualizar a esta versión</button>
+                <button class="btn sm" type="button" id="upload-btn">Subir .jar</button>
+                <input type="file" id="upload-input" accept=".jar" multiple hidden>
+              </div>
+            </div>
+            <p class="hint" id="mods-vanilla" hidden>Los mods necesitan Fabric: cambia el loader arriba.</p>
+            <p class="hint">Se instalan solos al pulsar Jugar. Los mods que el jugador tenga y no estén aquí se borran.</p>
+            <ul class="modlist" id="mod-list"></ul>
+            <div class="search">
+              <input id="mod-search" placeholder="Buscar mods en Modrinth (por ejemplo: sodium, voice chat…)" autocomplete="off">
+              <ul class="results" id="mod-results"></ul>
+            </div>
+          </section>
+          <div class="actions">
+            <button class="btn primary" type="submit" id="save">Crear evento</button>
+            <span class="hint" id="dirty" hidden>Cambios sin guardar</span>
+          </div>
         </form>
 
         <section class="card" id="whitelist" hidden>
@@ -268,12 +306,14 @@ function renderList() {
 
 const form = $("event-form");
 function updateVisibility() {
-  const usesPack = form.pack_code.value.trim() !== "";
-  for (const el of form.querySelectorAll(".nopack")) el.hidden = usesPack;
-  form.querySelector(".fabric-only").hidden = usesPack || form.loader.value !== "fabric";
+  const fabric = form.loader.value === "fabric";
+  form.querySelector(".fabric-only").hidden = !fabric;
+  $("mods-vanilla").hidden = fabric || mods.length === 0;
+  $("update-mods").hidden = !mods.some((m) => m.project_id && m.mc && m.mc !== form.minecraft_version.value.trim());
 }
-form.pack_code.addEventListener("input", updateVisibility);
-form.loader.addEventListener("change", () => { updateVisibility(); fillFabric(); });
+form.loader.addEventListener("change", () => { updateVisibility(); fillFabric(); markDirty(); });
+form.addEventListener("input", (e) => { if (e.target.id !== "mod-search") markDirty(); });
+function markDirty() { $("dirty").hidden = false; }
 
 // Versión de Fabric Loader automática: la última estable para esa versión de
 // Minecraft. Solo pisa el campo si está vacío o lo rellenó esto mismo.
@@ -284,9 +324,10 @@ form.loader_version.addEventListener("input", () => { fabricAuto = false; });
 form.minecraft_version.addEventListener("input", () => {
   clearTimeout(fabricTimer);
   fabricTimer = setTimeout(fillFabric, 500);
+  updateVisibility();
 });
 async function fillFabric() {
-  if (form.loader.value !== "fabric" || form.pack_code.value.trim() !== "") return;
+  if (form.loader.value !== "fabric") return;
   const mc = form.minecraft_version.value.trim();
   const hint = $("fabric-hint");
   const list = $("fabric-versions");
@@ -332,17 +373,23 @@ function renderEditor() {
   form.name.value = ev ? ev.name : "";
   form.description.value = ev ? ev.description || "" : "";
   form.server_address.value = ev ? ev.server_address || "" : "";
-  form.pack_code.value = ev ? ev.pack_code || "" : "";
   form.minecraft_version.value = ev ? ev.minecraft_version : "1.21.1";
   form.loader.value = ev ? ev.loader : "vanilla";
   form.loader_version.value = ev ? ev.loader_version || "" : "";
   form.memory_max.value = ev && ev.memory ? ev.memory.max_mb : ev ? "" : "4096";
   form.image_url.value = ev ? ev.image_url || "" : "";
   form.active.checked = ev ? ev.active : true;
+  mods = [];
+  pack = null;
+  $("mod-search").value = "";
+  $("mod-results").replaceChildren();
   updateVisibility();
+  renderMods();
+  if (ev && ev.pack_code) loadPack(ev);
   fabricAuto = false;
   $("fabric-hint").textContent = "";
   fillFabric();
+  $("dirty").hidden = true;
   $("whitelist").hidden = !ev;
   $("filter").value = "";
   renderPlayers();
@@ -350,7 +397,6 @@ function renderEditor() {
 
 function eventInput() {
   const t = (v) => v.trim() || null;
-  const usesPack = form.pack_code.value.trim() !== "";
   const max = Number(form.memory_max.value);
   const loader = form.loader.value;
   return {
@@ -358,13 +404,260 @@ function eventInput() {
     description: t(form.description.value),
     server_address: t(form.server_address.value),
     image_url: t(form.image_url.value),
-    pack_code: usesPack ? form.pack_code.value.trim().toUpperCase() : null,
-    minecraft_version: usesPack ? null : t(form.minecraft_version.value),
-    loader: usesPack ? null : loader,
-    loader_version: usesPack || loader === "vanilla" ? null : t(form.loader_version.value),
+    pack_code: null,
+    minecraft_version: t(form.minecraft_version.value),
+    loader,
+    loader_version: loader === "vanilla" ? null : t(form.loader_version.value),
     memory: max > 0 ? { min_mb: Math.min(2048, max), max_mb: max } : null,
     active: form.active.checked,
   };
+}
+
+// ───── Mods (se guardan como un pack del servidor) ─────
+let mods = [];     // lo que se está editando
+let pack = null;   // manifiesto del pack guardado (si lo hay)
+let modsDirty = false;
+let packLoading = false;
+
+async function loadPack(ev) {
+  packLoading = true;
+  $("mods-count").textContent = "Cargando mods…";
+  try {
+    const p = await api("GET", "/api/admin/packs/" + ev.pack_code);
+    if (current() !== ev) return;
+    pack = p;
+    mods = (p.mods || []).map((m) => ({ ...m }));
+    modsDirty = false;
+  } catch (err) {
+    toast("No se pudieron cargar los mods: " + err.message, "err");
+  } finally {
+    packLoading = false;
+    renderMods();
+    updateVisibility();
+  }
+}
+
+const mb = (n) => (n / 1048576).toFixed(n < 1048576 ? 2 : 1) + " MB";
+
+function renderMods() {
+  const list = $("mod-list");
+  list.replaceChildren();
+  if (!packLoading) $("mods-count").textContent = mods.length ? mods.length + (mods.length === 1 ? " mod" : " mods") : "Sin mods";
+  for (const m of mods) {
+    const li = document.createElement("li");
+    const ic = document.createElement(m.icon_url ? "img" : "div");
+    ic.className = "ic";
+    if (m.icon_url) { ic.src = m.icon_url; ic.alt = ""; }
+    const main = document.createElement("div");
+    main.className = "m-main";
+    const t = document.createElement("strong"); t.textContent = m.title || m.file_name;
+    const f = document.createElement("span"); f.className = "mono"; f.textContent = m.file_name + (m.size ? " · " + mb(m.size) : "");
+    main.append(t, f);
+    const src = document.createElement("span");
+    src.className = "src" + (m.dependency ? " dep" : "");
+    src.textContent = m.dependency ? "dependencia" : m.project_id ? "Modrinth" : "subido";
+    const x = document.createElement("button");
+    x.type = "button"; x.className = "x"; x.title = "Quitar"; x.textContent = "✕";
+    x.addEventListener("click", () => { mods = mods.filter((y) => y !== m); changedMods(); });
+    li.append(ic, main, src, x);
+    list.appendChild(li);
+  }
+  renderResults();
+}
+
+function changedMods() { modsDirty = true; markDirty(); renderMods(); updateVisibility(); }
+
+const MR = "https://api.modrinth.com/v2";
+async function mr(path) {
+  const res = await fetch(MR + path);
+  if (!res.ok) throw new Error("Modrinth respondió " + res.status);
+  return res.json();
+}
+const q = (v) => encodeURIComponent(JSON.stringify(v));
+
+/** La mejor versión de un proyecto para la versión de Minecraft actual (release si hay). */
+async function bestVersion(projectId, mc) {
+  const list = await mr("/project/" + projectId + "/version?loaders=" + q(["fabric"]) + "&game_versions=" + q([mc]));
+  return list.find((v) => v.version_type === "release") || list[0] || null;
+}
+
+function entryFrom(project, version, mc, dependency) {
+  const file = version.files.find((f) => f.primary) || version.files[0];
+  return {
+    file_name: file.filename,
+    url: file.url,
+    sha1: file.hashes.sha1,
+    size: file.size,
+    title: project.title,
+    project_id: project.id,
+    icon_url: project.icon_url || null,
+    mc,
+    ...(dependency ? { dependency: true } : {}),
+  };
+}
+
+/** Añade un proyecto y sus dependencias obligatorias. Devuelve los títulos añadidos. */
+async function addProject(projectId, mc, dependency, seen = new Set()) {
+  if (seen.has(projectId) || mods.some((m) => m.project_id === projectId)) return [];
+  seen.add(projectId);
+  const [project, version] = await Promise.all([mr("/project/" + projectId), bestVersion(projectId, mc)]);
+  if (!version) throw new Error(project.title + " no tiene versión para Fabric " + mc);
+  const entry = entryFrom(project, version, mc, dependency);
+  if (mods.some((m) => m.file_name === entry.file_name)) return [];
+  mods.push(entry);
+  const added = [project.title];
+  for (const d of version.dependencies || []) {
+    if (d.dependency_type !== "required" || !d.project_id) continue;
+    try { added.push(...(await addProject(d.project_id, mc, true, seen))); }
+    catch (err) { toast("Dependencia: " + err.message, "err"); }
+  }
+  return added;
+}
+
+let results = [];
+let searchTimer = null;
+let searchSeq = 0;
+$("mod-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(search, 350);
+});
+$("mod-search").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); clearTimeout(searchTimer); search(); } });
+
+async function search() {
+  const text = $("mod-search").value.trim();
+  const mc = form.minecraft_version.value.trim();
+  const seq = ++searchSeq;
+  if (!text) { results = []; renderResults(); return; }
+  try {
+    const facets = [["project_type:mod"], ["categories:fabric"], ["versions:" + mc]];
+    const data = await mr("/search?limit=10&query=" + encodeURIComponent(text) + "&facets=" + q(facets));
+    if (seq !== searchSeq) return;
+    results = data.hits;
+    renderResults();
+  } catch (err) {
+    if (seq === searchSeq) toast(err.message, "err");
+  }
+}
+
+function renderResults() {
+  const box = $("mod-results");
+  box.replaceChildren();
+  if (!$("mod-search").value.trim()) return;
+  if (results.length === 0) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "Nada para Fabric " + form.minecraft_version.value.trim() + ".";
+    box.appendChild(li);
+    return;
+  }
+  for (const h of results) {
+    const li = document.createElement("li");
+    const ic = document.createElement(h.icon_url ? "img" : "div");
+    ic.className = "ic";
+    if (h.icon_url) { ic.src = h.icon_url; ic.alt = ""; }
+    const main = document.createElement("div");
+    main.className = "m-main";
+    const t = document.createElement("strong"); t.textContent = h.title;
+    const d = document.createElement("span"); d.textContent = h.description;
+    main.append(t, d);
+    const has = mods.some((m) => m.project_id === h.project_id);
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "btn sm" + (has ? "" : " primary");
+    b.textContent = has ? "Añadido" : "+ Añadir";
+    b.disabled = has;
+    b.addEventListener("click", async () => {
+      if (form.loader.value !== "fabric") { toast("Los mods necesitan Fabric: cambia el loader arriba.", "err"); return; }
+      b.disabled = true;
+      b.textContent = "Añadiendo…";
+      try {
+        const added = await addProject(h.project_id, form.minecraft_version.value.trim(), false);
+        if (added.length > 1) toast("Añadido " + added[0] + " con: " + added.slice(1).join(", "), "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+      changedMods();
+    });
+    li.append(ic, main, b);
+    box.appendChild(li);
+  }
+}
+
+$("update-mods").addEventListener("click", async () => {
+  const mc = form.minecraft_version.value.trim();
+  const btn = $("update-mods");
+  btn.disabled = true;
+  btn.textContent = "Actualizando…";
+  const missing = [];
+  for (let i = 0; i < mods.length; i++) {
+    const m = mods[i];
+    if (!m.project_id || m.mc === mc) continue;
+    try {
+      const v = await bestVersion(m.project_id, mc);
+      if (!v) { missing.push(m.title); continue; }
+      mods[i] = entryFrom({ id: m.project_id, title: m.title, icon_url: m.icon_url }, v, mc, m.dependency);
+    } catch { missing.push(m.title); }
+  }
+  btn.disabled = false;
+  btn.textContent = "Actualizar a esta versión";
+  changedMods();
+  if (missing.length) toast("Sin versión para " + mc + ": " + missing.join(", ") + ". Quítalos o vuelve a la versión anterior.", "err");
+  else toast("Mods actualizados a " + mc, "ok");
+});
+
+$("upload-btn").addEventListener("click", () => $("upload-input").click());
+$("upload-input").addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  const btn = $("upload-btn");
+  btn.disabled = true;
+  for (const file of files) {
+    btn.textContent = "Subiendo " + file.name + "…";
+    try {
+      if (!file.name.toLowerCase().endsWith(".jar")) throw new Error("solo archivos .jar");
+      if (file.size > 25 * 1048576) throw new Error("pesa más de 25 MB");
+      const buf = await file.arrayBuffer();
+      const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      const res = await fetch("/api/files/" + sha1, { method: "PUT", headers: { authorization: "Bearer " + token }, body: buf });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Error " + res.status);
+      const name = file.name.replace(/[\\\\/]/g, "_");
+      mods = mods.filter((m) => m.file_name !== name);
+      mods.push({ file_name: name, url: location.origin + "/files/" + sha1, sha1, size: file.size, title: name.replace(/\\.jar$/i, "") });
+      changedMods();
+    } catch (err) {
+      toast(file.name + ": " + err.message, "err");
+    }
+  }
+  btn.disabled = false;
+  btn.textContent = "Subir .jar";
+});
+
+/** Crea el pack si hace falta y devuelve el código que debe usar el evento (o null). */
+async function packCodeFor(ev, input) {
+  const old = ev ? ev.pack_code || null : null;
+  const extra = pack && ((pack.resourcepacks || []).length || (pack.shaderpacks || []).length || (pack.config_files || []).length);
+  if (mods.length === 0 && !extra) return null;
+  if (input.loader !== "fabric" && mods.length) throw new Error("Los mods necesitan Fabric: cambia el loader.");
+  const same =
+    old && pack && !modsDirty &&
+    pack.minecraft_version === input.minecraft_version &&
+    pack.loader === input.loader &&
+    (pack.loader_version || null) === input.loader_version;
+  if (same) return old;
+  const created = await api("POST", "/api/packs", {
+    code: "",
+    name: input.name,
+    minecraft_version: input.minecraft_version,
+    loader: input.loader,
+    loader_version: input.loader_version,
+    java: pack ? pack.java || null : null,
+    memory: input.memory,
+    mods,
+    resourcepacks: pack ? pack.resourcepacks || [] : [],
+    shaderpacks: pack ? pack.shaderpacks || [] : [],
+    config_files: pack ? pack.config_files || [] : [],
+  });
+  return created.code;
 }
 
 form.addEventListener("submit", async (e) => {
@@ -372,9 +665,15 @@ form.addEventListener("submit", async (e) => {
   $("save").disabled = true;
   try {
     const ev = current();
+    if (packLoading) throw new Error("Espera a que carguen los mods");
+    const input = eventInput();
+    const oldCode = ev ? ev.pack_code || null : null;
+    input.pack_code = await packCodeFor(ev, input);
     const saved = ev
-      ? await api("PUT", "/api/admin/events/" + ev.id, eventInput())
-      : await api("POST", "/api/admin/events", eventInput());
+      ? await api("PUT", "/api/admin/events/" + ev.id, input)
+      : await api("POST", "/api/admin/events", input);
+    // El pack anterior ya no lo usa nadie: se borra (si falla no pasa nada).
+    if (oldCode && oldCode !== saved.pack_code) api("DELETE", "/api/packs/" + oldCode).catch(() => {});
     const i = events.findIndex((x) => x.id === saved.id);
     if (i >= 0) events[i] = saved; else events.unshift(saved);
     openId = saved.id;
