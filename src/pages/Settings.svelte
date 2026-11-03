@@ -296,8 +296,7 @@
             </label>
             <p class="hint">
               Déjalo vacío para usar el servidor de eventos de Obsidia. Ahí viven los eventos, su whitelist y
-              sus packs. Solo cámbialo si el organizador te da otra URL (carpeta <span class="mono">server/</span>
-              del repositorio).
+              sus packs. Solo cámbialo si el organizador te da otra URL.
             </p>
           </div>
         {:else}

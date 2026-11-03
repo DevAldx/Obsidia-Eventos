@@ -1,17 +1,6 @@
 <script lang="ts">
   import { app } from "../lib/app.svelte";
-  import { api } from "../lib/api";
-  import { toasts } from "../lib/toast.svelte";
-  import Icon from "../components/Icon.svelte";
   import Logo from "../components/Logo.svelte";
-
-  async function openRepository() {
-    try {
-      await api.openHttpsUrl("https://github.com/DevAldx/Obsidia-Eventos");
-    } catch (e) {
-      toasts.error(e, "No se pudo abrir el navegador");
-    }
-  }
 </script>
 
 <div class="hero facet">
@@ -25,7 +14,6 @@
       conecta directamente al servidor.
     </p>
   </div>
-  <button class="btn" onclick={openRepository}><Icon name="external" size={15} /> Repositorio</button>
 </div>
 
 <dl class="legal">
