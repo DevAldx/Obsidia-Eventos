@@ -153,6 +153,7 @@ pub(crate) struct MrFile {
 pub(crate) struct MrVersion {
     pub(crate) id: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) project_id: String,
     pub(crate) files: Vec<MrFile>,
 }

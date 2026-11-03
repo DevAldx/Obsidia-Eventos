@@ -9,6 +9,8 @@ const PREFIX: &str = "OBS-";
 /// Prefijo de la época de Nebula Launcher: las instancias y códigos ya
 /// existentes lo conservan y siguen siendo válidos.
 const LEGACY_PREFIX: &str = "NBL-";
+/// Instancias de evento: su ID es el del evento en el servidor (`EVT-XXXXXX`).
+const EVENT_PREFIX: &str = "EVT-";
 const SUFFIX_LEN: usize = 6;
 const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -32,7 +34,7 @@ impl InstanceId {
 
     pub fn parse(s: &str) -> Result<Self> {
         let valid = s.len() == PREFIX.len() + SUFFIX_LEN
-            && (s.starts_with(PREFIX) || s.starts_with(LEGACY_PREFIX))
+            && (s.starts_with(PREFIX) || s.starts_with(LEGACY_PREFIX) || s.starts_with(EVENT_PREFIX))
             && s[PREFIX.len()..]
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
@@ -47,6 +49,11 @@ impl InstanceId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// ¿Es la instancia de un evento (`EVT-XXXXXX`)?
+    pub fn is_event(&self) -> bool {
+        self.0.starts_with(EVENT_PREFIX)
     }
 
     /// ¿Es un ID `NBL-` de la época de Nebula Launcher?

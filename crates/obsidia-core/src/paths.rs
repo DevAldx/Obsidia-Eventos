@@ -20,17 +20,12 @@ pub struct ObsidiaPaths {
 
 impl ObsidiaPaths {
     pub fn from_system() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "obsidia", "obsidia").ok_or(CoreError::NoHomeDir)?;
-        let (config_dir, data_dir) = match ProjectDirs::from("dev", "nebula", "nebula") {
-            Some(legacy) => migrate_legacy_dirs(
-                legacy.config_dir(),
-                legacy.data_dir(),
-                dirs.config_dir(),
-                dirs.data_dir(),
-            ),
-            None => (dirs.config_dir().to_path_buf(), dirs.data_dir().to_path_buf()),
-        };
-        Ok(Self { config_dir, data_dir })
+        // Carpetas propias: Obsidia Eventos no toca las de Obsidia normal.
+        let dirs = ProjectDirs::from("dev", "obsidia", "obsidia-eventos").ok_or(CoreError::NoHomeDir)?;
+        Ok(Self {
+            config_dir: dirs.config_dir().to_path_buf(),
+            data_dir: dirs.data_dir().to_path_buf(),
+        })
     }
 
     pub fn new(config_dir: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {

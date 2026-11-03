@@ -7,7 +7,7 @@
 
   async function openRepository() {
     try {
-      await api.openHttpsUrl("https://github.com/DevAldx/Obsidia");
+      await api.openHttpsUrl("https://github.com/DevAldx/Obsidia-Eventos");
     } catch (e) {
       toasts.error(e, "No se pudo abrir el navegador");
     }
@@ -17,11 +17,12 @@
 <div class="hero facet">
   <Logo size={64} />
   <div class="hero-copy">
-    <strong class="display product">Obsidia</strong>
+    <strong class="display product">Obsidia Eventos</strong>
     <p class="muted">Versión {app.info?.version ?? "—"}</p>
     <p class="hint">
-      Launcher independiente y de código abierto para Minecraft: Java Edition, en Linux y Windows.
-      Gestiona instancias, mods y cuentas sin depender del launcher oficial.
+      Cliente privado de Minecraft: Java Edition para eventos. Solo entran las cuentas que el
+      organizador añade a la whitelist; el launcher prepara la versión y los mods del evento y te
+      conecta directamente al servidor.
     </p>
   </div>
   <button class="btn" onclick={openRepository}><Icon name="external" size={15} /> Repositorio</button>

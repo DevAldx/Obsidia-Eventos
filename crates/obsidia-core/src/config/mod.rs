@@ -129,7 +129,8 @@ pub struct Settings {
 
 /// Servidor oficial para compartir instancias (`server/` en el repositorio).
 /// Sirve los manifiestos `OBS-XXXXXX.json` y aloja los archivos subidos.
-pub const DEFAULT_SHARE_URL: &str = "https://obsidia-share.obsidia-share.workers.dev";
+/// Servidor de eventos (whitelist, eventos y packs). Ver `server/README.md`.
+pub const DEFAULT_SHARE_URL: &str = "https://obsidia-eventos.obsidia-share.workers.dev";
 
 /// `manifest_base_url` es un servidor propio opcional; vacío o `None` usa
 /// [`DEFAULT_SHARE_URL`]. Ver `obsidia_core::share` y `share_upload`.

@@ -127,7 +127,7 @@ jobs:
         # El aviso de actualización del launcher muestra el primer párrafo
         # de «## Cambios» de las notas de la versión.
         run: |
-          NOTES="$(./scripts/release-summary.sh "PATCH_NOTES_$VERSION.md" "Obsidia $VERSION: consulta las novedades en GitHub.")"
+          NOTES="$(./scripts/release-summary.sh "PATCH_NOTES_$VERSION.md" "Obsidia Eventos $VERSION: consulta las novedades en GitHub.")"
           export NOTES
           echo "Notas del actualizador: $NOTES"
           ./create_latest_json.sh
@@ -137,7 +137,7 @@ jobs:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           gh release create "$TAG" \
-            --title "Obsidia v$VERSION" \
+            --title "Obsidia Eventos v$VERSION" \
             --notes-file "PATCH_NOTES_$VERSION.md" \
             --latest \
             latest.json \

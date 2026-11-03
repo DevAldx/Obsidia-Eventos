@@ -55,10 +55,7 @@
           </div>
         </div>
         {#if app.account.kind === "offline"}
-          <p class="hint note">Solo sirve en servidores con <span class="mono">online-mode=false</span>.</p>
-          <button class="item" role="menuitem" onclick={() => run(() => app.openLocalSignIn())}>
-            <Icon name="edit" size={16} /> Cambiar nombre
-          </button>
+          <p class="hint note">Las cuentas locales no sirven en Obsidia Eventos: entra con Microsoft.</p>
         {/if}
         <button class="item" role="menuitem" onclick={() => run(() => nav.openSettings("skin"))}>
           <Icon name="shirt" size={16} /> Skin y capa
@@ -72,7 +69,7 @@
       {:else}
         <div class="signin">
           <strong class="display">Entra para jugar</strong>
-          <p class="hint">Con Microsoft accedes a servidores oficiales. La cuenta local no necesita contraseña.</p>
+          <p class="hint">Necesitas tu cuenta de Microsoft: el acceso a los eventos va por whitelist.</p>
         </div>
         <button
           class="btn primary wide"
@@ -81,9 +78,6 @@
           title="Flujo heredado de Microsoft, sin Azure (no oficial)"
         >
           {app.signInBusy && app.signInLegacy ? "Esperando a Microsoft…" : "Iniciar sesión con Microsoft"}
-        </button>
-        <button class="btn wide" onclick={() => run(() => app.openLocalSignIn())}>
-          <Icon name="user" size={15} /> Cuenta local
         </button>
         <button class="item subtle" role="menuitem" onclick={() => run(() => nav.openSettings("account"))}>
           Más opciones (Azure propia)…

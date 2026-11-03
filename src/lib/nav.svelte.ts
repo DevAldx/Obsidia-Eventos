@@ -1,7 +1,6 @@
 /** Navegación global: cualquier componente puede llevar a otra sección. */
 
-export type Page = "home" | "instances" | "discover" | "settings";
-export type InstanceTab = "overview" | "mods" | "settings" | "logs";
+export type Page = "home" | "admin" | "settings";
 export type SettingsSection =
   | "general"
   | "account"
@@ -9,27 +8,18 @@ export type SettingsSection =
   | "minecraft"
   | "java"
   | "appearance"
-  | "sharing"
+  | "server"
   | "updates"
   | "about";
 
 class NavState {
   page = $state<Page>("home");
-  /** Instancia abierta en el panel de detalle de «Instancias». */
-  instanceId = $state<string | null>(null);
-  instanceTab = $state<InstanceTab>("overview");
   settingsSection = $state<SettingsSection>("general");
-  /** Petición pendiente de abrir el asistente de creación al entrar en Instancias. */
-  createRequested = $state(false);
+  /** Evento cuyos registros se muestran (panel lateral de Inicio). */
+  logsFor = $state<string | null>(null);
 
   go(page: Page) {
     this.page = page;
-  }
-
-  openInstance(id: string, tab: InstanceTab = "overview") {
-    this.instanceId = id;
-    this.instanceTab = tab;
-    this.page = "instances";
   }
 
   openSettings(section: SettingsSection) {
@@ -37,9 +27,9 @@ class NavState {
     this.page = "settings";
   }
 
-  requestCreate() {
-    this.createRequested = true;
-    this.page = "instances";
+  openLogs(id: string) {
+    this.logsFor = id;
+    this.page = "home";
   }
 }
 

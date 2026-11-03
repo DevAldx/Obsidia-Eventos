@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 use super::mc::Profile;
 use crate::{error::CoreError, filesystem, ObsidiaPaths, Result};
 
-const SERVICE: &str = "dev.obsidia.launcher";
-/// Servicio donde Nebula Launcher guardaba el refresh token. Se lee una vez
-/// para migrar la sesión y después se borra.
-const LEGACY_SERVICE: &str = "dev.nebula.launcher";
+const SERVICE: &str = "dev.obsidia.eventos";
+/// Obsidia Eventos no hereda sesiones de otro launcher: este servicio no lo usa
+/// nadie, así que la migración nunca encuentra nada. NO poner aquí el de
+/// Obsidia normal (`dev.obsidia.launcher`): la migración borraría esa sesión.
+const LEGACY_SERVICE: &str = "dev.obsidia.eventos.unused";
 const USER: &str = "microsoft-refresh-token";
 
 /// Origen de la cuenta guardada. Las cuentas locales no tienen refresh token:

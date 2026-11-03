@@ -6,12 +6,11 @@
   import Logo from "./Logo.svelte";
   import AccountMenu from "./AccountMenu.svelte";
 
-  const items: { id: Page; label: string; icon: IconName }[] = [
-    { id: "home", label: "Inicio", icon: "home" },
-    { id: "instances", label: "Instancias", icon: "library" },
-    { id: "discover", label: "Descubrir", icon: "compass" },
+  const items = $derived<{ id: Page; label: string; icon: IconName }[]>([
+    { id: "home", label: "Eventos", icon: "star" },
+    ...(app.me?.admin ? [{ id: "admin" as Page, label: "Admin", icon: "layers" as IconName }] : []),
     { id: "settings", label: "Ajustes", icon: "settings" },
-  ];
+  ]);
 
   // En un navegador normal (vite dev sin Tauri) no hay ventana que controlar.
   const win: Window | null = (() => {
@@ -27,7 +26,7 @@
     const entry = Object.entries(app.games)[0];
     if (!entry) return null;
     const [id, state] = entry;
-    const inst = app.list.instances.find((i) => i.id === id);
+    const inst = app.me?.events.find((e) => e.id === id);
     const p = app.progress[id];
     const pct = p && p.total > 0 ? Math.min(100, Math.round((p.done / p.total) * 100)) : null;
     return { id, state, name: inst?.name ?? id, phase: p?.phase ?? "Preparando", pct };
@@ -35,9 +34,10 @@
 </script>
 
 <header class="topbar" data-tauri-drag-region>
-  <button class="brand" onclick={() => nav.go("home")} title="Obsidia">
+  <button class="brand" onclick={() => nav.go("home")} title="Obsidia Eventos">
     <Logo size={26} custom={app.launcherIcon} />
     <span class="wordmark">OBSIDIA</span>
+    <span class="edition">EVENTOS</span>
   </button>
 
   <nav aria-label="Secciones">
@@ -52,7 +52,7 @@
   <div class="drag" data-tauri-drag-region></div>
 
   {#if activity}
-    <button class="activity" onclick={() => nav.openInstance(activity.id, "logs")} title="Ver registros">
+    <button class="activity" onclick={() => nav.openLogs(activity.id)} title="Ver registros">
       <span class="dot" class:live={activity.state === "running"} class:busy={activity.state !== "running"}></span>
       <span class="act-text">
         {#if activity.state === "running"}
@@ -110,6 +110,16 @@
     border: none;
     cursor: pointer;
     color: var(--text);
+  }
+  .edition {
+    margin-left: -4px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    color: var(--accent-ink);
+    background: var(--accent);
   }
   .wordmark {
     font-family: var(--font-display);
@@ -236,7 +246,17 @@
     color: #fff;
   }
   @media (max-width: 1120px) {
-    .wordmark {
+    .edition {
+    margin-left: -4px;
+    padding: 2px 6px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    color: var(--accent-ink);
+    background: var(--accent);
+  }
+  .wordmark {
       display: none;
     }
     .brand {

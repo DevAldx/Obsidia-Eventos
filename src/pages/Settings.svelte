@@ -20,7 +20,7 @@
     { id: "updates", label: "Actualizaciones", icon: "refresh", group: "Launcher" },
     { id: "minecraft", label: "Minecraft", icon: "monitor", group: "Juego" },
     { id: "java", label: "Java y memoria", icon: "coffee", group: "Juego" },
-    { id: "sharing", label: "Compartir", icon: "share", group: "Juego" },
+    { id: "server", label: "Servidor de eventos", icon: "share", group: "Juego" },
     { id: "about", label: "Acerca de", icon: "info", group: "Obsidia" },
   ];
   const groups = ["Launcher", "Juego", "Obsidia"];
@@ -166,27 +166,24 @@
                   {app.account.kind === "offline" ? "Cuenta local" : app.account.flow === "legacy" ? "Microsoft · heredado" : "Microsoft"}
                 </span>
               </div>
-              {#if app.account.kind === "offline"}
-                <button class="btn" onclick={() => app.openLocalSignIn()}><Icon name="edit" size={15} /> Cambiar nombre</button>
-              {/if}
               <button class="btn danger-soft" onclick={() => app.signOut()}><Icon name="logout" size={15} /> Cerrar sesión</button>
             </div>
             {#if app.account.kind === "offline"}
-              <div class="alert info"><Icon name="info" size={16} /><span>Sin Microsoft ni Azure. Funciona en servidores con <span class="mono">online-mode=false</span>; los servidores oficiales la rechazan.</span></div>
+              <div class="alert"><Icon name="alert" size={16} /><span>Obsidia Eventos no admite cuentas locales: la whitelist de los eventos va por cuenta de Microsoft. Cierra la sesión y entra con Microsoft.</span></div>
             {:else if app.account.flow === "legacy"}
-              <div class="alert info"><Icon name="info" size={16} /><span>Sesión iniciada con el flujo heredado del launcher oficial. Funciona sin Azure, pero no es una integración oficial: Microsoft podría bloquearla. Si falla, usa una app de Azure propia o la cuenta local.</span></div>
+              <div class="alert info"><Icon name="info" size={16} /><span>Sesión iniciada con el flujo heredado del launcher oficial. Funciona sin Azure, pero no es una integración oficial: Microsoft podría bloquearla. Si falla, usa una app de Azure propia.</span></div>
             {/if}
+            <div class="group-block">
+              <p class="label">Tu identificador</p>
+              <p class="hint">Envía tu nombre y este UUID al organizador para que te añada a la whitelist.</p>
+              <p class="mono">{app.account.username} · {app.account.uuid}</p>
+            </div>
           {:else}
             <div class="signin-options">
               <button class="opt primary-opt" onclick={() => app.startLegacySignIn()} disabled={app.signInBusy}>
                 <Icon name="user" size={22} />
                 <strong>{app.signInBusy && app.signInLegacy ? "Esperando a Microsoft…" : "Microsoft"}</strong>
-                <span class="hint">Para servidores oficiales. Flujo heredado: no necesitas Azure, pero no es oficial y podría bloquearse.</span>
-              </button>
-              <button class="opt" onclick={() => app.openLocalSignIn()}>
-                <Icon name="edit" size={22} />
-                <strong>Cuenta local</strong>
-                <span class="hint">Solo un nombre. Para servidores con <span class="mono">online-mode=false</span>.</span>
+                <span class="hint">Obligatoria: la whitelist de los eventos va por tu cuenta de Microsoft. Flujo heredado: no necesitas Azure, pero no es oficial y podría bloquearse.</span>
               </button>
             </div>
             <details class="advanced">
@@ -291,17 +288,16 @@
             </div>
             <p class="hint">Cada instancia elige su Java en sus ajustes. En automático se usa el que pide su versión de Minecraft y, si falta, se descarga solo.</p>
           </div>
-        {:else if nav.settingsSection === "sharing"}
+        {:else if nav.settingsSection === "server"}
           <div class="group-block">
             <label class="field">
-              <span>Servidor para compartir <span class="hint">(opcional)</span></span>
+              <span>Servidor de eventos <span class="hint">(opcional)</span></span>
               <input class="mono" bind:value={draft.sharingUrl} placeholder={DEFAULT_SHARE_URL} />
             </label>
             <p class="hint">
-              Déjalo vacío para usar el servidor oficial de Obsidia. Ahí se guardan los códigos cortos como
-              <span class="mono">OBS-K7P2X9</span> con sus mods privados, imagen y configuración. Solo cámbialo si
-              montas tu propio servidor (carpeta <span class="mono">server/</span> del repositorio); quien importe
-              tus códigos necesitará entonces la misma URL.
+              Déjalo vacío para usar el servidor de eventos de Obsidia. Ahí viven los eventos, su whitelist y
+              sus packs. Solo cámbialo si el organizador te da otra URL (carpeta <span class="mono">server/</span>
+              del repositorio).
             </p>
           </div>
         {:else}

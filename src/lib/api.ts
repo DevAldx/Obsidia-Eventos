@@ -1,19 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppInfo,
-  Instance,
   JavaRuntime,
   InstanceList,
-  ModEntry,
   UpdateCheck,
   BackgroundView,
-  ExportedCode,
-  UploadedPack,
-  InstanceManifest,
-  NewInstance,
   Settings,
   StartupProgress,
-  UpdateInstance,
   VersionSummary,
   Account,
   SignInCodeEvent,
@@ -21,13 +14,10 @@ import type {
   SkinProfile,
   SkinVariant,
   LibrarySkin,
-  SearchQuery,
-  SearchResults,
-  InstallOutcome,
-  MrVersion,
-  ModpackPreview,
-  CatalogEntry,
-  CatalogFile,
+  MyEvents,
+  AdminEvent,
+  EventInput,
+  Player,
 } from "./types";
 
 /** Los comandos de Rust fallan con `{ message }`; lo normalizamos a Error. */
@@ -50,29 +40,20 @@ export const api = {
   getSettings: () => call<Settings>("get_settings"),
   saveSettings: (settings: Settings) => call<Settings>("save_settings", { settings }),
   listInstances: () => call<InstanceList>("list_instances"),
-  createInstance: (input: NewInstance) => call<Instance>("create_instance", { input }),
-  updateInstance: (id: string, patch: UpdateInstance) =>
-    call<Instance>("update_instance", { id, patch }),
-  deleteInstance: (id: string) => call<Settings>("delete_instance", { id }),
   getAccount: () => call<Account | null>("get_account"),
   getSignInCode: () => call<SignInCodeEvent | null>("get_sign_in_code"),
   beginSignIn: () => call<SignInCodeEvent>("begin_sign_in"),
   beginLegacySignIn: () => call<SignInCodeEvent>("begin_legacy_sign_in"),
-  signInOffline: (username: string) => call<Account>("sign_in_offline", { username }),
   cancelSignIn: () => call<void>("cancel_sign_in"),
   signOut: () => call<void>("sign_out"),
   listJava: () => call<JavaRuntime[]>("list_java_runtimes"),
   listVersions: () => call<VersionSummary[]>("list_minecraft_versions"),
-  play: (id: string) => call<void>("play_instance", { id }),
   stop: (id: string) => call<void>("stop_instance", { id }),
   gameStates: () => call<Record<string, string>>("game_states"),
   openUrl: (url: string) => call<void>("open_url", { url }),
   openHttpsUrl: (url: string) => call<void>("open_https_url", { url }),
   checkForUpdates: () => call<UpdateCheck>("check_for_updates"),
   getInstanceBackground: (instanceId: string) => call<BackgroundView | null>("get_instance_background", { instanceId }),
-  setInstanceBackground: (instanceId: string, mime: string, dataBase64: string) =>
-    call<void>("set_instance_background", { instanceId, mime, dataBase64 }),
-  clearInstanceBackground: (instanceId: string) => call<void>("clear_instance_background", { instanceId }),
   getLauncherBackground: () => call<BackgroundView | null>("get_launcher_background"),
   setLauncherBackground: (mime: string, dataBase64: string) =>
     call<void>("set_launcher_background", { mime, dataBase64 }),
@@ -81,24 +62,8 @@ export const api = {
   setLauncherIcon: (mime: string, dataBase64: string) =>
     call<void>("set_launcher_icon", { mime, dataBase64 }),
   clearLauncherIcon: () => call<void>("clear_launcher_icon"),
-  fetchShareManifest: (code: string) => call<InstanceManifest>("fetch_share_manifest", { code }),
-  importFromCode: (manifest: InstanceManifest) =>
-    call<void>("import_from_code", { code: manifest.code, manifest }),
-  exportManifestTemplate: (instanceId: string) => call<string>("export_manifest_template", { instanceId }),
-  exportShareCode: (instanceId: string, description: string | null, backgroundUrl: string | null) =>
-    call<ExportedCode>("export_share_code", { instanceId, description, backgroundUrl }),
-  uploadSharePack: (instanceId: string, description: string | null, includeConfig: boolean) =>
-    call<UploadedPack>("upload_share_pack", { instanceId, description, includeConfig }),
-  listMods: (instanceId: string) => call<ModEntry[]>("list_mods", { instanceId }),
-  setModEnabled: (instanceId: string, fileName: string, enabled: boolean) =>
-    call<string>("set_mod_enabled", { instanceId, fileName, enabled }),
-  deleteMod: (instanceId: string, fileName: string) =>
-    call<void>("delete_mod", { instanceId, fileName }),
-  importMods: (instanceId: string, files: { name: string; data_base64: string }[]) =>
-    call<string[]>("import_mods", { instanceId, files }),
-  openInstanceFolder: (instanceId: string, sub: "" | "mods" | "config") =>
+  openInstanceFolder: (instanceId: string, sub: "" | "screenshots") =>
     call<void>("open_instance_folder", { instanceId, sub }),
-  selectInstance: (id: string | null) => call<Settings>("select_instance", { id }),
   checkAndPrepareUpdate: () => call<ObsidiaUpdateStatus>("check_and_prepare_update"),
   installUpdate: () => call<void>("install_update"),
   fetchNews: (force = false) => call<NewsFeed>("fetch_news", { force }),
@@ -111,26 +76,20 @@ export const api = {
   listSkinLibrary: () => call<LibrarySkin[]>("list_skin_library"),
   deleteLibrarySkin: (id: string) => call<void>("delete_library_skin", { id }),
 
-  // Modrinth
-  modrinthSearch: (query: SearchQuery) => call<SearchResults>("modrinth_search", { query }),
-  modrinthInstalled: (instanceId: string) => call<string[]>("modrinth_installed", { instanceId }),
-  modrinthInstallMod: (instanceId: string, projectId: string) =>
-    call<InstallOutcome>("modrinth_install_mod", { instanceId, projectId }),
-  modpackVersions: (projectId: string) => call<MrVersion[]>("modpack_versions", { projectId }),
-  modpackPreviewVersion: (versionId: string, iconUrl: string | null) =>
-    call<ModpackPreview>("modpack_preview_version", { versionId, iconUrl }),
-  modpackPreviewFile: (dataBase64: string) => call<ModpackPreview>("modpack_preview_file", { dataBase64 }),
-  modpackInstall: (token: string) => call<void>("modpack_install", { token }),
+  // Eventos (la whitelist se comprueba en el servidor)
+  eventsMe: () => call<MyEvents>("events_me"),
+  eventPlay: (id: string) => call<void>("event_play", { id }),
 
-  // Catálogo comunitario
-  catalogList: () => call<CatalogEntry[]>("catalog_list"),
-  catalogPublishPack: (code: string, description: string | null) =>
-    call<CatalogEntry>("catalog_publish_pack", { code, description }),
-  catalogPublishMod: (instanceId: string, fileName: string, name: string, description: string | null) =>
-    call<CatalogEntry>("catalog_publish_mod", { instanceId, fileName, name, description }),
-  catalogDelete: (id: string) => call<void>("catalog_delete", { id }),
-  catalogInstallMod: (instanceId: string, file: CatalogFile) =>
-    call<string>("catalog_install_mod", { instanceId, file }),
+  // Administración
+  adminEventsList: () => call<AdminEvent[]>("admin_events_list"),
+  adminEventSave: (id: string | null, input: EventInput) =>
+    call<AdminEvent>("admin_event_save", { id, input }),
+  adminEventDelete: (id: string) => call<void>("admin_event_delete", { id }),
+  adminResolvePlayer: (query: string) => call<Player>("admin_resolve_player", { query }),
+  adminPlayersAdd: (id: string, players: Player[]) =>
+    call<Player[]>("admin_players_add", { id, players }),
+  adminPlayerRemove: (id: string, uuid: string) =>
+    call<Player[]>("admin_player_remove", { id, uuid }),
 };
 
 /** "-Xmx2G -XX:+UseG1GC" → ["-Xmx2G", "-XX:+UseG1GC"] */
@@ -148,5 +107,5 @@ export type ObsidiaUpdateStatus = {
   update: ObsidiaUpdateInfo | null;
 };
 
-/** Servidor oficial para compartir. Debe coincidir con `DEFAULT_SHARE_URL` de `obsidia-core`. */
-export const DEFAULT_SHARE_URL = "https://obsidia-share.obsidia-share.workers.dev";
+/** Servidor de eventos. Debe coincidir con `DEFAULT_SHARE_URL` de `obsidia-core`. */
+export const DEFAULT_SHARE_URL = "https://obsidia-eventos.obsidia-share.workers.dev";

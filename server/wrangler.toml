@@ -1,27 +1,30 @@
-name = "obsidia-share"
+name = "obsidia-eventos"
 main = "src/index.js"
 compatibility_date = "2025-10-01"
 
 # ── Almacenamiento ──────────────────────────────────────────────────────────
-# Opción A (por defecto, sin tarjeta): Workers KV. 1 GB, archivos de hasta 25 MB.
-# Crea el namespace con `npx wrangler kv namespace create FILES` y pega su id aquí.
+# Usa un namespace PROPIO, no el de obsidia-share: los packs y la whitelist de
+# eventos no deben mezclarse con lo que comparte la comunidad.
+# Créalo con `npx wrangler kv namespace create FILES` y pega su id aquí.
 [[kv_namespaces]]
 binding = "FILES"
-id = "75ce242dd6c64c459eefa9cf7bfe49e8"
+id = "07e896586a8f4a6ea49ade0a6736d18d"
 
-# Opción B (pide tarjeta aunque sea gratis): R2. 10 GB, archivos de hasta 50 MB.
-# Si la activas, R2 tiene prioridad sobre KV.
+# Opción B (pide tarjeta aunque sea gratis): R2. Si la activas, tiene prioridad.
 # [[r2_buckets]]
 # binding = "BUCKET"
-# bucket_name = "obsidia-share"
+# bucket_name = "obsidia-eventos"
 
 [vars]
 # Tamaño máximo de un archivo subido (MB). Con KV nunca pasa de 25.
 MAX_FILE_MB = "25"
-# Lo que puede subir cada cuenta de Minecraft al día (MB) y cuántos packs.
-DAILY_UPLOAD_MB = "500"
-DAILY_PACKS = "30"
-# UUIDs (sin guiones, separados por comas) que pueden borrar cualquier publicación del catálogo.
-ADMIN_UUIDS = ""
+# Lo que puede subir cada admin al día (MB) y cuántos packs.
+DAILY_UPLOAD_MB = "2000"
+DAILY_PACKS = "50"
+# UUIDs de los organizadores (sin guiones, separados por comas). Solo ellos
+# pueden crear eventos, editar la whitelist y subir packs.
+ADMIN_UUIDS = "a6e6588335244eaeb2008c74c6b27223"
 
-# El secreto de firma NO va aquí: `npx wrangler secret put SECRET`
+# Secretos (NO van aquí):
+#   npx wrangler secret put SECRET       # firma de sesiones: openssl rand -base64 48
+#   npx wrangler secret put SERVER_KEY   # clave del servidor de Minecraft: openssl rand -hex 24

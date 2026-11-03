@@ -12,7 +12,7 @@
     step: 0,
     total: stepNames.length,
     percent: 4,
-    label: "Iniciando Obsidia",
+    label: "Iniciando Obsidia Eventos",
     detail: "Preparando la ventana de bienvenida…",
     done: false,
     version: "",
@@ -80,7 +80,7 @@
     </div>
 
     <h1>OBSIDIA</h1>
-    <p class="tagline">Forjado para jugar</p>
+    <p class="edition">EVENTOS · CLIENTE PRIVADO</p>
 
     <div class="status" aria-live="polite">
       <div class="status-line">
@@ -162,12 +162,12 @@
     letter-spacing: 0.32em;
     margin-right: -0.32em;
   }
-  .tagline {
-    margin-top: 4px;
+  .edition {
+    margin-top: 6px;
     font-size: 11px;
-    letter-spacing: 0.26em;
-    text-transform: uppercase;
-    color: var(--muted);
+    font-weight: 700;
+    letter-spacing: 0.28em;
+    color: var(--accent-hover, #b78cff);
   }
   .status {
     width: min(400px, 100%);

@@ -36,7 +36,7 @@ por separado.
 
 ## Ejemplos con la versión actual
 
-La versión publicada ahora es **0.3.1**:
+Obsidia Eventos empieza en **0.1.0**. Ejemplos con otra versión:
 
 | Cambio | Nueva versión | Comando |
 |---|---|---|

@@ -6,7 +6,9 @@ import { createHash } from "node:crypto";
 import worker from "../src/index.js";
 
 const ORIGIN = "https://share.example.com";
-const UUID = "0123456789abcdef0123456789abcdef";
+const UUID = "0123456789abcdef0123456789abcdef"; // admin
+const PLAYER = "fedcba9876543210fedcba9876543210"; // jugador normal
+const SERVER_KEY = "k".repeat(32);
 
 function memoryBucket() {
   const store = new Map();
@@ -56,13 +58,14 @@ function memoryKv() {
 const USE_KV = process.env.STORAGE === "kv";
 
 function makeEnv() {
-  const base = { SECRET: "x".repeat(40), MAX_FILE_MB: "1", MOJANG_PLAYER_KEYS: MOJANG_KEY_B64 };
+  const base = {
+    SECRET: "x".repeat(40),
+    MAX_FILE_MB: "1",
+    MOJANG_PLAYER_KEYS: MOJANG_KEY_B64,
+    ADMIN_UUIDS: UUID,
+    SERVER_KEY: SERVER_KEY,
+  };
   return USE_KV ? { ...base, FILES: memoryKv() } : { ...base, BUCKET: memoryBucket() };
-}
-
-function setOwner(env, key, owner) {
-  if (USE_KV) env.FILES.store.get(key).metadata.custom.owner = owner;
-  else env.BUCKET.store.get(key).customMetadata.owner = owner;
 }
 
 // El Worker no debe llamar a ninguna red: todo se verifica con firmas.
@@ -113,7 +116,7 @@ async function loginAs(env, opts = {}) {
   const message = opts.signTicket ?? ch.ticket;
   return call(env, "POST", "/api/login", {
     body: JSON.stringify({
-      uuid: opts.claimUuid ?? UUID.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5"),
+      uuid: opts.claimUuid ?? (opts.uuid ?? UUID).replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5"),
       ticket: ch.ticket,
       publicKey: cert.publicKey,
       publicKeySignatureV2: cert.publicKeySignatureV2,
@@ -169,64 +172,55 @@ test("login con certificado de jugador: acepta el bueno y rechaza los falsos", a
   assert.equal(forged.status, 401, "ticket manipulado");
 });
 
-test("flujo completo: subir, crear pack, leerlo, descargar y borrar", async () => {
+const tokenOf = async (env, uuid = UUID) => (await (await loginAs(env, { uuid })).json()).token;
+const post = (env, path, token, body) => call(env, "POST", path, { token, body: JSON.stringify(body) });
+
+test("solo los admins suben archivos y packs", async () => {
   const env = makeEnv();
-  const { token } = await (await loginAs(env)).json();
-  const jar = new TextEncoder().encode("contenido de un mod privado");
+  const admin = await tokenOf(env);
+  const player = await tokenOf(env, PLAYER);
+  const jar = new TextEncoder().encode("contenido de un mod del evento");
   const hash = sha1(jar);
 
   assert.equal((await call(env, "PUT", `/api/files/${hash}`, { body: jar })).status, 401, "subir requiere sesión");
-  assert.equal((await upload(env, token, jar)).status, 201);
-  assert.equal((await (await upload(env, token, jar)).json()).existed, true, "dedupe por hash");
+  assert.equal((await upload(env, player, jar)).status, 403, "un jugador no sube");
+  assert.equal((await upload(env, admin, jar)).status, 201);
+  assert.equal((await (await upload(env, admin, jar)).json()).existed, true, "dedupe por hash");
 
-  const created = await call(env, "POST", "/api/packs", {
-    token,
-    body: JSON.stringify(manifest(`${ORIGIN}/files/${hash}`, hash, jar.byteLength)),
-  });
+  const body = manifest(`${ORIGIN}/files/${hash}`, hash, jar.byteLength);
+  assert.equal((await post(env, "/api/packs", player, body)).status, 403);
+  const created = await post(env, "/api/packs", admin, body);
   assert.equal(created.status, 201);
   const { code } = await created.json();
   assert.match(code, /^OBS-[A-Z0-9]{6}$/);
 
-  const fetched = await (await call(env, "GET", `/${code}.json`)).json();
-  assert.equal(fetched.code, code);
-  assert.equal(fetched.mods[0].sha1, hash);
-
+  assert.equal((await call(env, "GET", `/${code}.json`)).status, 404, "el manifiesto ya no es público");
   const file = await call(env, "GET", `/files/${hash}`);
-  assert.equal(file.status, 200);
   assert.equal(sha1(new Uint8Array(await file.arrayBuffer())), hash);
 
-  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token })).status, 204);
-  assert.equal((await call(env, "GET", `/${code}.json`)).status, 404);
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token: player })).status, 403);
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token: admin })).status, 204);
 });
 
 test("rechaza hashes falsos, archivos grandes y URLs ajenas", async () => {
   const env = makeEnv();
-  const { token } = await (await loginAs(env)).json();
+  const token = await tokenOf(env);
   const jar = new TextEncoder().encode("abc");
-
   const wrongHash = await call(env, "PUT", `/api/files/${"0".repeat(40)}`, {
     body: jar,
     token,
     headers: { "content-length": "3" },
   });
   assert.equal(wrongHash.status, 400);
-
-  const big = new Uint8Array(2 * 1024 * 1024);
-  assert.equal((await upload(env, token, big)).status, 413);
+  assert.equal((await upload(env, token, new Uint8Array(2 * 1024 * 1024))).status, 413);
 
   const hash = sha1(jar);
   for (const url of [`https://evil.example/files/${hash}`, `${ORIGIN}/files/${hash}`]) {
-    // la segunda es nuestra pero el archivo nunca se subió
-    const r = await call(env, "POST", "/api/packs", { token, body: JSON.stringify(manifest(url, hash, 3)) });
-    assert.equal(r.status, 400, url);
+    assert.equal((await post(env, "/api/packs", token, manifest(url, hash, 3))).status, 400, url);
   }
-
-  const traversal = manifest(`https://${"cdn.modrinth.com"}/x.jar`, hash, 3);
+  const traversal = manifest("https://cdn.modrinth.com/x.jar", hash, 3);
   traversal.mods[0].file_name = "../../evil.jar";
-  assert.equal((await call(env, "POST", "/api/packs", { token, body: JSON.stringify(traversal) })).status, 400);
-
-  const modrinth = manifest("https://cdn.modrinth.com/data/x/sodium.jar", hash, 3);
-  assert.equal((await call(env, "POST", "/api/packs", { token, body: JSON.stringify(modrinth) })).status, 201);
+  assert.equal((await post(env, "/api/packs", token, traversal)).status, 400);
 });
 
 test("sin almacenamiento configurado responde un error claro", async () => {
@@ -235,84 +229,104 @@ test("sin almacenamiento configurado responde un error claro", async () => {
   assert.match((await r.json()).error, /almacenamiento/);
 });
 
-test("solo el dueño puede borrar un pack", async () => {
+test("whitelist: solo ve el evento quien está en la lista", async () => {
   const env = makeEnv();
-  const { token } = await (await loginAs(env)).json();
-  const r = await call(env, "POST", "/api/packs", {
-    token,
-    body: JSON.stringify(manifest("https://cdn.modrinth.com/a.jar", "a".repeat(40), 1)),
+  const admin = await tokenOf(env);
+  const player = await tokenOf(env, PLAYER);
+
+  // Un jugador no puede administrar.
+  assert.equal((await call(env, "GET", "/api/admin/events", { token: player })).status, 403);
+  assert.equal((await post(env, "/api/admin/events", player, { name: "x", minecraft_version: "1.21.1" })).status, 403);
+
+  const pack = await post(env, "/api/packs", admin, manifest("https://cdn.modrinth.com/data/a/a.jar", "a".repeat(40), 1));
+  const { code } = await pack.json();
+  const created = await post(env, "/api/admin/events", admin, {
+    name: "Evento privado",
+    description: "Solo invitados",
+    server_address: "mc.example.com:25570",
+    pack_code: code,
   });
-  const { code } = await r.json();
-  const key = `packs/${code}.json`;
-  setOwner(env, key, "f".repeat(32));
-  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token })).status, 403);
+  assert.equal(created.status, 201, await created.clone().text());
+  const event = await created.json();
+  assert.match(event.id, /^EVT-[A-Z0-9]{6}$/);
+  assert.equal(event.loader, "fabric", "versión y loader salen del pack");
+  assert.equal(event.loader_version, "0.16.5");
+
+  // Fuera de la whitelist: no ve nada (ni IP ni pack).
+  let mine = await (await call(env, "GET", "/api/events", { token: player })).json();
+  assert.equal(mine.admin, false);
+  assert.deepEqual(mine.events, []);
+  assert.ok(!JSON.stringify(mine).includes("mc.example.com"));
+
+  // Dentro de la whitelist: ve el evento con su pack.
+  const dashedPlayer = PLAYER.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+  const add = await post(env, `/api/admin/events/${event.id}/players`, admin, {
+    players: [{ uuid: dashedPlayer, name: "Jugador_1" }],
+  });
+  assert.equal(add.status, 200);
+  mine = await (await call(env, "GET", "/api/events", { token: player })).json();
+  assert.equal(mine.events.length, 1);
+  assert.equal(mine.events[0].server_address, "mc.example.com:25570");
+  assert.equal(mine.events[0].manifest.code, event.id);
+  assert.equal(mine.events[0].manifest.mods.length, 1);
+
+  // Evento desactivado: desaparece para los jugadores, no para los admins.
+  const edit = await call(env, "PUT", `/api/admin/events/${event.id}`, {
+    token: admin,
+    body: JSON.stringify({ name: "Evento privado", pack_code: code, active: false }),
+  });
+  assert.equal(edit.status, 200);
+  assert.equal((await (await call(env, "GET", "/api/events", { token: player })).json()).events.length, 0);
+  assert.equal((await (await call(env, "GET", "/api/events", { token: admin })).json()).events.length, 1);
+  await call(env, "PUT", `/api/admin/events/${event.id}`, {
+    token: admin,
+    body: JSON.stringify({ name: "Evento privado", pack_code: code, server_address: "mc.example.com" }),
+  });
+
+  // No se puede borrar un pack que usa un evento.
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token: admin })).status, 409);
+
+  // Whitelist para el servidor de Minecraft.
+  const wlPath = `/api/server/${event.id}/whitelist.json`;
+  assert.equal((await call(env, "GET", wlPath)).status, 401);
+  assert.equal((await call(env, "GET", `${wlPath}?key=mala`)).status, 401);
+  const wl = await (await call(env, "GET", wlPath, { token: SERVER_KEY })).json();
+  assert.deepEqual(wl, [{ uuid: dashedPlayer, name: "Jugador_1" }]);
+
+  // Quitarlo de la lista le corta el acceso.
+  const del = await call(env, "DELETE", `/api/admin/events/${event.id}/players/${PLAYER}`, { token: admin });
+  assert.equal(del.status, 200);
+  assert.equal((await (await call(env, "GET", "/api/events", { token: player })).json()).events.length, 0);
+
+  assert.equal((await call(env, "DELETE", `/api/admin/events/${event.id}`, { token: admin })).status, 204);
+  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token: admin })).status, 204);
 });
 
-test("catálogo: publicar pack y mod, listar, y solo el dueño o un admin borra", async () => {
+test("valida los datos del evento", async () => {
   const env = makeEnv();
-  const { token } = await (await loginAs(env)).json();
-  const jar = new TextEncoder().encode("mod de la comunidad");
-  const hash = sha1(jar);
-
-  assert.deepEqual(await (await call(env, "GET", "/api/catalog")).json(), { items: [] });
-
-  // El mod tiene que estar subido antes.
-  const modBody = (size = jar.byteLength) =>
-    JSON.stringify({
-      kind: "mod",
-      name: "Mi mod",
-      author: "Steve",
-      description: "Hace cosas",
-      minecraft_version: "1.21.1",
-      loader: "fabric",
-      file: { file_name: "mi-mod.jar", sha1: hash, size },
-    });
-  assert.equal((await call(env, "POST", "/api/catalog", { token, body: modBody() })).status, 400, "sin subir");
-  await upload(env, token, jar);
-  assert.equal((await call(env, "POST", "/api/catalog", { body: modBody() })).status, 401, "sin sesión");
-  assert.equal((await call(env, "POST", "/api/catalog", { token, body: modBody(999) })).status, 400, "tamaño falso");
-  const mod = await call(env, "POST", "/api/catalog", { token, body: modBody() });
-  assert.equal(mod.status, 201, await mod.clone().text());
-  const modEntry = await mod.json();
-  assert.equal(modEntry.owner, UUID);
-  assert.equal((await call(env, "POST", "/api/catalog", { token, body: modBody() })).status, 409, "duplicado");
-
-  const created = await call(env, "POST", "/api/packs", {
-    token,
-    body: JSON.stringify(manifest(`${ORIGIN}/files/${hash}`, hash, jar.byteLength)),
+  const admin = await tokenOf(env);
+  const bad = [
+    {},
+    { name: "x", minecraft_version: "../1" },
+    { name: "x", minecraft_version: "1.21.1", loader: "forge" },
+    { name: "x", minecraft_version: "1.21.1", loader: "fabric" },
+    { name: "x", minecraft_version: "1.21.1", server_address: "http://mc.example.com" },
+    { name: "x", minecraft_version: "1.21.1", server_address: "mc.example.com:99999" },
+    { name: "x", minecraft_version: "1.21.1", pack_code: "OBS-NOEXIS" },
+    { name: "x", minecraft_version: "1.21.1", memory: { min_mb: 4096, max_mb: 1024 } },
+  ];
+  for (const body of bad) {
+    assert.equal((await post(env, "/api/admin/events", admin, body)).status >= 400, true, JSON.stringify(body));
+  }
+  const ok = await post(env, "/api/admin/events", admin, {
+    name: "Vanilla",
+    minecraft_version: "1.21.1",
+    server_address: "play.example.net",
   });
-  const { code } = await created.json();
-  const pack = await call(env, "POST", "/api/catalog", {
-    token,
-    body: JSON.stringify({ kind: "pack", code, author: "Steve" }),
+  assert.equal(ok.status, 201);
+  const { id } = await ok.json();
+  const badPlayers = await post(env, `/api/admin/events/${id}/players`, admin, {
+    players: [{ uuid: "no-es-uuid", name: "x" }],
   });
-  assert.equal(pack.status, 201);
-  const packEntry = await pack.json();
-  assert.equal(packEntry.mod_count, 1);
-
-  const bad = await call(env, "POST", "/api/catalog", {
-    token,
-    body: JSON.stringify({ kind: "pack", code, author: "no válido!" }),
-  });
-  assert.equal(bad.status, 400, "autor inválido");
-
-  const list = await (await call(env, "GET", "/api/catalog")).json();
-  assert.deepEqual(
-    list.items.map((e) => e.kind),
-    ["pack", "mod"],
-  );
-
-  // Otro dueño no puede borrar; un admin sí.
-  const catalogKey = "catalog/index.json";
-  const raw = USE_KV ? env.FILES.store.get(catalogKey).value : env.BUCKET.store.get(catalogKey).bytes;
-  const data = JSON.parse(new TextDecoder().decode(raw));
-  data.items.find((e) => e.id === modEntry.id).owner = "f".repeat(32);
-  await (USE_KV ? env.FILES : env.BUCKET).put(catalogKey, new TextEncoder().encode(JSON.stringify(data)));
-  assert.equal((await call(env, "DELETE", `/api/catalog/${modEntry.id}`, { token })).status, 403);
-  env.ADMIN_UUIDS = UUID;
-  assert.equal((await call(env, "DELETE", `/api/catalog/${modEntry.id}`, { token })).status, 204);
-
-  // Borrar el pack lo quita también del catálogo.
-  assert.equal((await call(env, "DELETE", `/api/packs/${code}`, { token })).status, 204);
-  assert.deepEqual((await (await call(env, "GET", "/api/catalog")).json()).items, []);
+  assert.equal(badPlayers.status, 400);
 });

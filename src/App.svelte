@@ -7,11 +7,9 @@
   import Toasts from "./components/Toasts.svelte";
   import Logo from "./components/Logo.svelte";
   import Home from "./pages/Home.svelte";
-  import Instances from "./pages/Instances.svelte";
-  import Discover from "./pages/Discover.svelte";
+  import Admin from "./pages/Admin.svelte";
   import SettingsPage from "./pages/Settings.svelte";
   import SignInDialog from "./components/SignInDialog.svelte";
-  import LocalSignInDialog from "./components/LocalSignInDialog.svelte";
   import UpdateDialog from "./components/UpdateDialog.svelte";
 
   onMount(() => app.init());
@@ -43,7 +41,7 @@
     {#if app.fatal}
       <div class="state">
         <Logo size={56} />
-        <h1>No se pudo iniciar Obsidia</h1>
+        <h1>No se pudo iniciar Obsidia Eventos</h1>
         <p class="alert">{app.fatal}</p>
       </div>
     {:else if !app.ready}
@@ -60,10 +58,8 @@
         <div class="page page-{nav.page}" in:fly={{ y: 8, duration: ms }}>
           {#if nav.page === "home"}
             <Home />
-          {:else if nav.page === "instances"}
-            <Instances />
-          {:else if nav.page === "discover"}
-            <Discover />
+          {:else if nav.page === "admin" && app.me?.admin}
+            <Admin />
           {:else}
             <SettingsPage />
           {/if}
@@ -74,7 +70,6 @@
 </div>
 
 <SignInDialog />
-<LocalSignInDialog />
 <UpdateDialog />
 <Toasts />
 
@@ -110,8 +105,8 @@
     height: 100%;
     overflow-y: auto;
   }
-  /* Instancias y Ajustes gestionan su propio scroll interno por columnas. */
-  .page-instances,
+  /* Admin y Ajustes gestionan su propio scroll interno por columnas. */
+  .page-admin,
   .page-settings {
     overflow: hidden;
   }

@@ -78,7 +78,7 @@ pub struct InstanceManifest {
 
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 /// Mismo límite que `background`: 15 MB.
-const MAX_BACKGROUND_BYTES: usize = 15 * 1024 * 1024;
+pub(crate) const MAX_BACKGROUND_BYTES: usize = 15 * 1024 * 1024;
 /// Topes agregados: un manifiesto pequeño puede declarar miles de archivos
 /// enormes y llenar el disco si no se limita el conjunto.
 const MAX_MANIFEST_FILES: usize = 512;
@@ -164,7 +164,7 @@ fn manifest_url(base_url: &str, code: &str) -> Result<String> {
 /// Hosts https distintos que aparecen en los archivos del manifiesto. Solo
 /// esos se permiten al descargarlos: nada fuera de lo que el propio
 /// manifiesto declaró.
-fn hosts_in(manifest: &InstanceManifest) -> Result<Vec<String>> {
+pub(crate) fn hosts_in(manifest: &InstanceManifest) -> Result<Vec<String>> {
     let mut hosts = HashSet::new();
     let mut add = |raw: &str, label: &str| -> Result<()> {
         let url = reqwest::Url::parse(raw).map_err(|e| {
@@ -254,7 +254,7 @@ pub fn java_satisfied(manifest: &InstanceManifest, available_majors: &[u32]) -> 
     }
 }
 
-async fn download_set(
+pub(crate) async fn download_set(
     dl: &Downloader,
     dest_dir: &std::path::Path,
     files: &[ManifestFile],

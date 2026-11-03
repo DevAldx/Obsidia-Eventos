@@ -1,10 +1,10 @@
 [package]
-name = "obsidia"
-version = "0.5.0"
+name = "obsidia-eventos"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
-description = "Obsidia: launcher de Minecraft ligero"
+description = "Obsidia Eventos: cliente privado de Minecraft para eventos"
 
 # Tauri exige su propio workspace; la lógica vive en ../crates/obsidia-core.
 [workspace]

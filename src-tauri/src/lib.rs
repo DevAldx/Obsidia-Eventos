@@ -10,27 +10,20 @@ use std::{
 use obsidia_core::{
     auth::{self, Account, AccountKind, AccountStore, AuthEndpoints, AuthFlow},
     config::Settings,
-    instances::{
-        InstanceId, InstanceList, InstanceStore, InstanceView, JavaChoice, Loader, NewInstance,
-        UpdateInstance,
-    },
+    events::{self, AdminEvent, EventInput, MyEvents, Player},
+    instances::{InstanceId, InstanceList, InstanceStore},
     java::{self, JavaRuntime},
     launcher::{self, LaunchAuth, LaunchInput, Screen},
     background,
-    catalog::{self, CatalogEntry, CatalogFile},
-    modrinth::{self, ModpackPreview, MrVersion, SearchQuery, SearchResults},
-    minecraft::{fabric, install::copy_assets, Installer, Reporter, VersionSummary},
-    mods::{self, ModEntry},
+    minecraft::{install::copy_assets, Installer, Reporter, VersionSummary},
     auth::skins::{self, LibrarySkin, SkinProfile, SkinVariant},
     news::{self, NewsFeed},
-    share::{self, InstanceManifest},
-    share_code::{self, ExportInput, ExportedCode},
-    share_upload::{self, Identity, UploadInput, UploadedPack},
+    share_upload::Identity,
     updater::{self, UpdateCheck},
     CoreError, ObsidiaPaths,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::oneshot;
@@ -59,6 +52,8 @@ struct AppState {
     news_http: reqwest::Client,
     /// Token de Minecraft Services para skins/capas: (UUID de la cuenta, token, emisión).
     mc_token: Mutex<Option<(String, String, std::time::Instant)>>,
+    /// Sesión en el servidor de eventos: (UUID de la cuenta, sesión, emisión).
+    event_session: Mutex<Option<(String, events::Session, std::time::Instant)>>,
 }
 
 impl AppState {
@@ -136,13 +131,6 @@ impl From<CoreError> for CommandError {
 // llamada enorme no duplique memoria (cadena + bytes) ni agote el proceso.
 const MAX_BACKGROUND_B64: usize = 21 * 1024 * 1024; // 15 MB de imagen + margen
 const MAX_ICON_B64: usize = 6 * 1024 * 1024; // 4 MB de PNG + margen
-const MAX_MOD_B64: usize = 268 * 1024 * 1024; // 200 MB por mod + margen
-const MAX_MOD_FILES: usize = 256;
-/// 256 MB de `.mrpack` en base64 (+ margen).
-const MAX_MRPACK_B64: usize = 344 * 1024 * 1024;
-// Tope agregado del IPC: evita que 256 archivos de 200 MB se decodifiquen a la
-// vez (hasta ~51 GB en memoria) y agoten el proceso.
-const MAX_MOD_TOTAL_B64: usize = 1024 * 1024 * 1024; // 1 GiB codificado
 
 type CmdResult<T> = Result<T, CommandError>;
 
@@ -604,20 +592,13 @@ fn cancel_sign_in(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     Ok(())
 }
 
-/// Inicia sesión con una cuenta local (sin Microsoft/Azure). El nombre y el
-/// UUID determinista se guardan en `accounts/account.json`; no se necesita
-/// ningún secreto ni conexión.
-#[tauri::command]
-fn sign_in_offline(state: State<'_, AppState>, username: String) -> CmdResult<AccountView> {
-    let account = auth::offline_account(&username)?;
-    state.auth_store.save_offline(&account)?;
-    Ok(account.into())
-}
-
 #[tauri::command]
 fn sign_out(state: State<'_, AppState>) -> CmdResult<()> {
     state.auth_store.clear()?;
     if let Ok(mut slot) = state.mc_token.lock() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = state.event_session.lock() {
         *slot = None;
     }
     Ok(())
@@ -888,163 +869,15 @@ fn list_instances(state: State<'_, AppState>) -> CmdResult<InstanceList> {
     Ok(state.instances.list()?)
 }
 
-#[tauri::command]
-async fn create_instance(
-    state: State<'_, AppState>,
-    mut input: NewInstance,
-) -> CmdResult<InstanceView> {
-    let known = state.installer.version_list().await?;
-    if !known.iter().any(|v| v.id == input.minecraft_version.trim()) {
-        return Err(CommandError::new(format!(
-            "la versión {} no existe en el manifiesto de Mojang",
-            input.minecraft_version.trim()
-        )));
-    }
-    if input.loader == Loader::Fabric {
-        let versions = state
-            .installer
-            .fabric_loader_versions(input.minecraft_version.trim())
-            .await?;
-        let stable = fabric::pick_stable(&versions)?;
-        input.loader_version = Some(stable.to_owned());
-    }
-    Ok(state.instances.create(input)?)
-}
-
-#[tauri::command]
-async fn update_instance(
-    state: State<'_, AppState>,
-    id: String,
-    patch: UpdateInstance,
-) -> CmdResult<InstanceView> {
-    let id = InstanceId::parse(&id)?;
-    if let Some(choice) = &patch.java {
-        let runtimes = java::detect(&state.paths).await;
-        java::ensure_known(&runtimes, choice)?;
-    }
-    Ok(state.instances.update(&id, patch)?)
-}
-
-#[tauri::command]
-fn delete_instance(state: State<'_, AppState>, id: String) -> CmdResult<Settings> {
-    let id = InstanceId::parse(&id)?;
-    if state.games()?.contains_key(id.as_str()) {
-        return Err(CommandError::new("la instancia está en uso; ciérrala primero"));
-    }
-    state.instances.delete(&id)?;
-    let mut settings = state.settings()?;
-    if settings.selected_instance.as_ref() == Some(&id) {
-        settings.selected_instance = None;
-        settings.save(&state.paths.settings_file())?;
-    }
-    Ok(settings.clone())
-}
-
-#[tauri::command]
-fn select_instance(state: State<'_, AppState>, id: Option<String>) -> CmdResult<Settings> {
-    let id = id.as_deref().map(InstanceId::parse).transpose()?;
-    if let Some(id) = &id {
-        state.instances.get(id)?; // debe existir
-    }
-    let mut settings = state.settings()?;
-    settings.selected_instance = id;
-    settings.save(&state.paths.settings_file())?;
-    Ok(settings.clone())
-}
-
-// ───────────────────────────── Mods ─────────────────────────────
-
-fn mods_dir_for(state: &AppState, instance_id: &str) -> CmdResult<std::path::PathBuf> {
-    let id = InstanceId::parse(instance_id)?;
-    Ok(state.paths.instance_dir(&id).join("mods"))
-}
-
-#[tauri::command]
-fn list_mods(state: State<'_, AppState>, instance_id: String) -> CmdResult<Vec<ModEntry>> {
-    Ok(mods::list(&mods_dir_for(&state, &instance_id)?)?)
-}
-
-#[tauri::command]
-fn set_mod_enabled(
-    state: State<'_, AppState>,
-    instance_id: String,
-    file_name: String,
-    enabled: bool,
-) -> CmdResult<String> {
-    Ok(mods::set_enabled(&mods_dir_for(&state, &instance_id)?, &file_name, enabled)?)
-}
-
-#[tauri::command]
-fn delete_mod(state: State<'_, AppState>, instance_id: String, file_name: String) -> CmdResult<()> {
-    Ok(mods::delete(&mods_dir_for(&state, &instance_id)?, &file_name)?)
-}
-
-/// Un archivo elegido en el selector nativo del navegador (webview): el frontend
-/// no tiene la ruta real, así que manda nombre + contenido en base64.
-#[derive(Deserialize)]
-struct ImportModInput {
-    name: String,
-    data_base64: String,
-}
-
-#[tauri::command]
-fn import_mods(
-    state: State<'_, AppState>,
-    instance_id: String,
-    files: Vec<ImportModInput>,
-) -> CmdResult<Vec<String>> {
-    let mods_dir = mods_dir_for(&state, &instance_id)?;
-    if files.len() > MAX_MOD_FILES {
-        return Err(CommandError::new(format!(
-            "demasiados archivos en una sola importación (máximo {MAX_MOD_FILES})"
-        )));
-    }
-
-    let mut total_b64 = 0usize;
-    for f in &files {
-        total_b64 = total_b64
-            .checked_add(f.data_base64.len())
-            .ok_or_else(|| CommandError::new("la importación es demasiado grande"))?;
-        if total_b64 > MAX_MOD_TOTAL_B64 {
-            return Err(CommandError::new(
-                "la importación supera el tamaño total máximo admitido",
-            ));
-        }
-    }
-
-    // Se procesa de uno en uno: el pico de memoria es el de un solo mod, no el
-    // de todos los archivos seleccionados.
-    let mut written = Vec::with_capacity(files.len());
-    for f in files {
-        if f.data_base64.len() > MAX_MOD_B64 {
-            return Err(CommandError::new(format!(
-                "{}: el archivo es demasiado grande",
-                f.name
-            )));
-        }
-        let bytes = BASE64
-            .decode(f.data_base64.as_bytes())
-            .map_err(|e| CommandError::new(format!("{}: archivo no válido ({e})", f.name)))?;
-        written.push(mods::import_one(
-            &mods_dir,
-            mods::ImportFile {
-                name: f.name,
-                bytes,
-            },
-        )?);
-    }
-    Ok(written)
-}
-
-/// Abre en el explorador de archivos del sistema la carpeta `mods` o `config`
-/// de una instancia (nunca una ruta arbitraria: `sub` solo admite esos dos valores).
+/// Abre en el explorador de archivos la carpeta de un evento o sus capturas
+/// (nunca una ruta arbitraria: `sub` solo admite esos dos valores).
 #[tauri::command]
 fn open_instance_folder(
     state: State<'_, AppState>,
     instance_id: String,
     sub: String,
 ) -> CmdResult<()> {
-    if !matches!(sub.as_str(), "" | "mods" | "config") {
+    if !matches!(sub.as_str(), "" | "screenshots") {
         return Err(CommandError::new("carpeta no permitida"));
     }
     let id = InstanceId::parse(&instance_id)?;
@@ -1055,145 +888,12 @@ fn open_instance_folder(
         .map_err(|e| CommandError::new(format!("no se pudo abrir el explorador de archivos: {e}")))
 }
 
-// ───────────────────────────── Compartir por código ─────────────────────────────
+// ───────────────────────────── Eventos y whitelist ─────────────────────────────
 
-fn manifest_base_url(state: &AppState) -> CmdResult<String> {
-    Ok(state.settings()?.sharing.effective_url())
-}
-
-#[tauri::command]
-async fn fetch_share_manifest(state: State<'_, AppState>, code: String) -> CmdResult<InstanceManifest> {
-    // Los códigos `OBS1-…` llevan todo dentro: no necesitan servidor propio.
-    if share_code::is_pack_code(&code) {
-        return Ok(share_code::resolve(&state.auth_http, &code).await?);
-    }
-    let base = manifest_base_url(&state)?;
-    Ok(share::fetch_manifest(&state.auth_http, &base, &code).await?)
-}
-
-#[derive(Clone, Serialize)]
-struct ImportStateEvent {
-    /// `success` o `error`.
-    state: &'static str,
-    instance_id: Option<String>,
-    message: Option<String>,
-}
-
-/// Instala en segundo plano (misma mecánica que `play_instance`): el progreso
-/// llega por el evento `install-progress` ya existente, y el resultado final
-/// por `import-state`.
-#[tauri::command]
-async fn import_from_code(
-    app: AppHandle,
-    _state: State<'_, AppState>,
-    code: String,
-    manifest: InstanceManifest,
-) -> CmdResult<()> {
-    // Se instala exactamente el manifiesto que el usuario vio en la vista
-    // previa. Volver a pedirlo al servidor permitía que cambiara entre la
-    // aprobación y la instalación (TOCTOU).
-    let code = share::validate_code(&code)?;
-    if manifest.code != code {
-        return Err(CommandError::new(
-            "el manifiesto no corresponde al código solicitado",
-        ));
-    }
-    share::validate_manifest(&manifest)?;
-
-    let app2 = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app2.state::<AppState>();
-        let progress_id = manifest.code.clone();
-        let reporter = {
-            let app3 = app2.clone();
-            Reporter::new(move |p| {
-                let _ = app3.emit(
-                    "install-progress",
-                    ProgressEvent {
-                        id: &progress_id,
-                        phase: p.phase,
-                        done: p.done,
-                        total: p.total,
-                    },
-                );
-            })
-        };
-        let result = async {
-            // Antes de los mods se descarga Minecraft (juego, librerías,
-            // assets y loader) y el Java que pide: la instancia importada queda
-            // lista y «Jugar» arranca sin esperar más descargas.
-            let prepared = state
-                .installer
-                .prepare(
-                    &manifest.minecraft_version,
-                    manifest.loader,
-                    manifest.loader_version.as_deref(),
-                    &reporter,
-                )
-                .await?;
-            java::ensure_for_meta(&state.paths, &JavaChoice::Auto, &prepared.meta, &reporter).await?;
-            share::install(&state.paths, &state.instances, &manifest, &reporter).await
-        }
-        .await;
-        let event = match result {
-            Ok(id) => ImportStateEvent {
-                state: "success",
-                instance_id: Some(id.to_string()),
-                message: None,
-            },
-            Err(e) => ImportStateEvent {
-                state: "error",
-                instance_id: None,
-                message: Some(e.to_string()),
-            },
-        };
-        let _ = app2.emit("import-state", event);
-    });
-    Ok(())
-}
-
-/// Genera un código `OBS1-…` autocontenido con los datos de la instancia
-/// (nombre, versión, loader, memoria, imagen y archivos de Modrinth).
-#[tauri::command]
-async fn export_share_code(
-    state: State<'_, AppState>,
-    instance_id: String,
-    description: Option<String>,
-    background_url: Option<String>,
-) -> CmdResult<ExportedCode> {
-    let id = InstanceId::parse(&instance_id)?;
-    let view = state.instances.get(&id)?;
-    let dir = state.paths.instance_dir(&id);
-    let inst = &view.instance;
-    Ok(share_code::export(
-        &state.auth_http,
-        ExportInput {
-            name: &inst.name,
-            description: description.as_deref(),
-            minecraft_version: &inst.minecraft_version,
-            loader: inst.loader,
-            loader_version: inst.loader_version.as_deref(),
-            memory: inst.memory,
-            background_url: background_url.as_deref(),
-            mods_dir: &dir.join("mods"),
-            resourcepacks_dir: &dir.join("resourcepacks"),
-            shaderpacks_dir: &dir.join("shaderpacks"),
-        },
-    )
-    .await?)
-}
-
-#[derive(Clone, Serialize)]
-struct ShareProgressEvent {
-    instance_id: String,
-    phase: String,
-    done: u64,
-    total: u64,
-}
-
-/// Cuenta con la que se sube al servidor para compartir. Hace falta una cuenta
-/// de Microsoft real: el servidor la verifica con el certificado de Mojang.
-async fn share_identity(state: &AppState, client_id: &str) -> CmdResult<Identity> {
+/// Cuenta con la que se entra al servidor de eventos. Hace falta una cuenta de
+/// Microsoft real: el servidor la verifica con el certificado de Mojang, y la
+/// whitelist se comprueba por su UUID.
+async fn event_identity(state: &AppState, client_id: &str) -> CmdResult<Identity> {
     match state.auth_store.cached_account() {
         Some(account) if account.kind != AccountKind::Offline => {
             let ep = AuthEndpoints::live();
@@ -1209,14 +909,14 @@ async fn share_identity(state: &AppState, client_id: &str) -> CmdResult<Identity
             }
         }
         _ => Err(CommandError::new(
-            "para subir o publicar necesitas iniciar sesión con una cuenta de Microsoft (las cuentas locales no sirven).",
+            "inicia sesión con tu cuenta de Microsoft para ver tus eventos.",
         )),
     }
 }
 
-/// URL del servidor para compartir y Client ID de Microsoft (el guard de
-/// ajustes no puede cruzar un `await`).
-fn share_settings(state: &AppState) -> CmdResult<(String, String)> {
+/// URL del servidor de eventos y Client ID de Microsoft (el guard de ajustes
+/// no puede cruzar un `await`).
+fn event_settings(state: &AppState) -> CmdResult<(String, String)> {
     let settings = state.settings()?;
     Ok((
         settings.sharing.effective_url(),
@@ -1224,264 +924,177 @@ fn share_settings(state: &AppState) -> CmdResult<(String, String)> {
     ))
 }
 
-/// Sube la instancia al servidor para compartir y devuelve un código corto.
-/// Lo que está en Modrinth no se sube; mods privados, imagen y configs sí.
-/// El progreso llega por el evento `share-progress`.
-#[tauri::command]
-async fn upload_share_pack(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    instance_id: String,
-    description: Option<String>,
-    include_config: bool,
-) -> CmdResult<UploadedPack> {
-    let id = InstanceId::parse(&instance_id)?;
-    let view = state.instances.get(&id)?;
-    let (base, client_id) = share_settings(&state)?;
-    let identity = share_identity(&state, &client_id).await?;
+/// Las sesiones del servidor duran 1 h; se renuevan un poco antes.
+const EVENT_SESSION_TTL: Duration = Duration::from_secs(50 * 60);
 
-    let dir = state.paths.instance_dir(&id);
-    let inst = &view.instance;
-    let progress = |phase: &str, done: u64, total: u64| {
-        let _ = app.emit(
-            "share-progress",
-            ShareProgressEvent {
-                instance_id: instance_id.clone(),
-                phase: phase.to_owned(),
-                done,
-                total,
-            },
-        );
-    };
-    Ok(share_upload::upload(
-        &base,
-        &identity,
-        UploadInput {
-            name: &inst.name,
-            description: description.as_deref(),
-            minecraft_version: &inst.minecraft_version,
-            loader: inst.loader,
-            loader_version: inst.loader_version.as_deref(),
-            memory: inst.memory,
-            instance_dir: &dir,
-            include_config,
-        },
-        &progress,
-    )
-    .await?)
-}
-
-/// Escribe una plantilla de manifiesto (sin URLs, a rellenar a mano) dentro de
-/// la propia carpeta de la instancia y devuelve la ruta.
-#[tauri::command]
-fn export_manifest_template(state: State<'_, AppState>, instance_id: String) -> CmdResult<String> {
-    let id = InstanceId::parse(&instance_id)?;
-    let view = state.instances.get(&id)?;
-    let mod_names: Vec<String> = mods::list(&state.paths.instance_dir(&id).join("mods"))?
-        .into_iter()
-        .filter(|m| m.enabled)
-        .map(|m| m.file_name)
-        .collect();
-    let template = share::export_template(
-        id.as_str(),
-        &view.instance.name,
-        &view.instance.minecraft_version,
-        view.instance.loader,
-        view.instance.loader_version.as_deref(),
-        &mod_names,
-    );
-    let json = serde_json::to_string_pretty(&template)
-        .map_err(|e| CommandError::new(format!("no se pudo generar el manifiesto: {e}")))?;
-    let dest = state.paths.instance_dir(&id).join("manifest-template.json");
-    std::fs::write(&dest, json)
-        .map_err(|e| CommandError::new(format!("no se pudo escribir el manifiesto: {e}")))?;
-    Ok(dest.to_string_lossy().into_owned())
-}
-
-// ───────────────────────────── Modrinth ─────────────────────────────
-
-#[tauri::command]
-async fn modrinth_search(query: SearchQuery) -> CmdResult<SearchResults> {
-    Ok(modrinth::search(&modrinth::http_client()?, &query).await?)
-}
-
-/// IDs de los proyectos de Modrinth que ya tiene la instancia.
-#[tauri::command]
-async fn modrinth_installed(state: State<'_, AppState>, instance_id: String) -> CmdResult<Vec<String>> {
-    let dir = mods_dir_for(&state, &instance_id)?;
-    Ok(modrinth::installed_projects(&modrinth::http_client()?, &dir)
-        .await?
-        .into_iter()
-        .collect())
-}
-
-#[tauri::command]
-async fn modrinth_install_mod(
-    state: State<'_, AppState>,
-    instance_id: String,
-    project_id: String,
-) -> CmdResult<modrinth::InstallOutcome> {
-    let id = InstanceId::parse(&instance_id)?;
-    let inst = state.instances.get(&id)?.instance;
-    let dir = state.paths.instance_dir(&id).join("mods");
-    Ok(modrinth::install_mod(
-        &modrinth::http_client()?,
-        &dir,
-        &project_id,
-        &inst.minecraft_version,
-        inst.loader,
-    )
-    .await?)
-}
-
-/// Versiones de un modpack que Obsidia sabe instalar (Fabric o Vanilla).
-#[tauri::command]
-async fn modpack_versions(project_id: String) -> CmdResult<Vec<MrVersion>> {
-    let versions = modrinth::project_versions(&modrinth::http_client()?, &project_id, None, None).await?;
-    Ok(versions
-        .into_iter()
-        .filter(|v| v.loaders.iter().any(|l| l == "fabric" || l == "minecraft"))
-        .take(60)
-        .collect())
-}
-
-#[tauri::command]
-async fn modpack_preview_version(
-    state: State<'_, AppState>,
-    version_id: String,
-    icon_url: Option<String>,
-) -> CmdResult<ModpackPreview> {
-    Ok(modrinth::preview_version(&modrinth::http_client()?, &state.paths, &version_id, icon_url).await?)
-}
-
-/// Un `.mrpack` elegido desde el PC (el webview manda el contenido en base64).
-#[tauri::command]
-fn modpack_preview_file(state: State<'_, AppState>, data_base64: String) -> CmdResult<ModpackPreview> {
-    if data_base64.len() > MAX_MRPACK_B64 {
-        return Err(CommandError::new("el modpack es demasiado grande"));
+async fn event_session(state: &AppState, fresh: bool) -> CmdResult<events::Session> {
+    let (base, client_id) = event_settings(state)?;
+    let account_uuid = state
+        .auth_store
+        .cached_account()
+        .map(|a| a.uuid)
+        .unwrap_or_default();
+    if !fresh {
+        if let Ok(slot) = state.event_session.lock() {
+            if let Some((uuid, session, at)) = slot.as_ref() {
+                if *uuid == account_uuid
+                    && session.base == base.trim().trim_end_matches('/')
+                    && at.elapsed() < EVENT_SESSION_TTL
+                {
+                    return Ok(session.clone());
+                }
+            }
+        }
     }
-    let bytes = BASE64
-        .decode(data_base64.as_bytes())
-        .map_err(|e| CommandError::new(format!("archivo no válido ({e})")))?;
-    Ok(modrinth::preview_bytes(&state.paths, &bytes, None)?)
+    let identity = event_identity(state, &client_id).await?;
+    let session = events::login(&base, &identity).await?;
+    if let Ok(mut slot) = state.event_session.lock() {
+        *slot = Some((identity.uuid.clone(), session.clone(), std::time::Instant::now()));
+    }
+    Ok(session)
 }
 
-/// Instala el modpack previsualizado en segundo plano. El progreso llega por
-/// `install-progress` (con `id` = token) y el resultado por `import-state`,
-/// igual que al importar por código.
+/// Ejecuta `f` con la sesión guardada; si el servidor la rechaza (caducada o
+/// el servidor cambió su secreto), inicia sesión otra vez y reintenta una vez.
+async fn with_event_session<T, F, Fut>(state: &AppState, f: F) -> CmdResult<T>
+where
+    F: Fn(events::Session) -> Fut,
+    Fut: std::future::Future<Output = Result<T, CoreError>>,
+{
+    let session = event_session(state, false).await?;
+    match f(session).await {
+        Err(e) if events::is_session_error(&e) => {
+            let session = event_session(state, true).await?;
+            Ok(f(session).await?)
+        }
+        other => Ok(other?),
+    }
+}
+
+/// Eventos a los que tiene acceso la cuenta. Si la lista está vacía y no es
+/// admin, la cuenta no está en ninguna whitelist.
 #[tauri::command]
-async fn modpack_install(app: AppHandle, state: State<'_, AppState>, token: String) -> CmdResult<()> {
-    let (mc, loader, loader_version) = modrinth::cached_requirements(&state.paths, &token)?;
-    let app2 = app.clone();
+async fn events_me(state: State<'_, AppState>) -> CmdResult<MyEvents> {
+    with_event_session(&state, |s| async move { events::my_events(&s).await }).await
+}
+
+/// Prepara la instancia del evento (versión, mods del pack) y entra al
+/// servidor. El evento se vuelve a pedir al servidor aquí mismo: el frontend
+/// solo manda el ID, así que no puede inventarse un evento ni una dirección.
+#[tauri::command]
+fn event_play(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    let id = InstanceId::parse(&id)?;
+    if !id.is_event() {
+        return Err(CommandError::new("identificador de evento inválido"));
+    }
+    {
+        let mut games = state.games()?;
+        if games.contains_key(id.as_str()) {
+            return Err(CommandError::new("este evento ya se está preparando o ejecutando"));
+        }
+        games.insert(id.to_string(), GameSlot::Preparing);
+    }
+    emit_state(&app, id.as_str(), "preparing", None, None);
+
     tauri::async_runtime::spawn(async move {
-        let state = app2.state::<AppState>();
-        let reporter = {
-            let app3 = app2.clone();
-            let progress_id = token.clone();
-            Reporter::new(move |p| {
-                let _ = app3.emit(
-                    "install-progress",
-                    ProgressEvent {
-                        id: &progress_id,
-                        phase: p.phase,
-                        done: p.done,
-                        total: p.total,
-                    },
-                );
-            })
-        };
         let result = async {
-            let prepared = state
-                .installer
-                .prepare(&mc, loader, loader_version.as_deref(), &reporter)
-                .await?;
-            java::ensure_for_meta(&state.paths, &JavaChoice::Auto, &prepared.meta, &reporter).await?;
-            modrinth::install_modpack(&state.paths, &state.instances, &token, &reporter).await
+            let state = app.state::<AppState>();
+            let reporter = progress_reporter(&app, id.as_str());
+            reporter.phase("Comprobando acceso al evento", 0);
+            let me = with_event_session(&state, |s| async move { events::my_events(&s).await })
+                .await
+                .map_err(|e| CoreError::Network(e.message))?;
+            let event = me
+                .events
+                .into_iter()
+                .find(|e| e.id == id.as_str())
+                .ok_or_else(|| CoreError::Auth("ya no tienes acceso a este evento".into()))?;
+            if !event.active && !me.admin {
+                return Err(CoreError::Auth("este evento está cerrado".into()));
+            }
+            events::sync_instance(&state.paths, &state.instances, &event, &reporter).await?;
+            prepare_and_run(&app, &id, event.server_address.as_deref()).await
         }
         .await;
-        let event = match result {
-            Ok(id) => ImportStateEvent {
-                state: "success",
-                instance_id: Some(id.to_string()),
-                message: None,
-            },
-            Err(e) => ImportStateEvent {
-                state: "error",
-                instance_id: None,
-                message: Some(e.to_string()),
-            },
-        };
-        let _ = app2.emit("import-state", event);
+        if let Ok(mut games) = app.state::<AppState>().games.lock() {
+            games.remove(id.as_str());
+        }
+        match result {
+            Ok(code) => emit_state(&app, id.as_str(), "stopped", None, code),
+            Err(e) => emit_state(&app, id.as_str(), "error", Some(e.to_string()), None),
+        }
     });
     Ok(())
 }
 
-// ───────────────────────────── Catálogo comunitario ─────────────────────────────
-
 #[tauri::command]
-async fn catalog_list(state: State<'_, AppState>) -> CmdResult<Vec<CatalogEntry>> {
-    let (base, _) = share_settings(&state)?;
-    Ok(catalog::list(&base).await?)
+async fn admin_events_list(state: State<'_, AppState>) -> CmdResult<Vec<AdminEvent>> {
+    with_event_session(&state, |s| async move { events::admin_list(&s).await }).await
 }
 
 #[tauri::command]
-async fn catalog_publish_pack(
+async fn admin_event_save(
     state: State<'_, AppState>,
-    code: String,
-    description: Option<String>,
-) -> CmdResult<CatalogEntry> {
-    let (base, client_id) = share_settings(&state)?;
-    let identity = share_identity(&state, &client_id).await?;
-    Ok(catalog::publish_pack(&base, &identity, &code, description.as_deref()).await?)
+    id: Option<String>,
+    input: EventInput,
+) -> CmdResult<AdminEvent> {
+    with_event_session(&state, |s| {
+        let id = id.clone();
+        let input = input.clone();
+        async move { events::admin_save(&s, id.as_deref(), &input).await }
+    })
+    .await
 }
 
 #[tauri::command]
-async fn catalog_publish_mod(
+async fn admin_event_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    with_event_session(&state, |s| {
+        let id = id.clone();
+        async move { events::admin_delete(&s, &id).await }
+    })
+    .await?;
+    // La instancia local del evento ya no sirve para nada.
+    if let Ok(iid) = InstanceId::parse(&id) {
+        if iid.is_event() && !state.games()?.contains_key(iid.as_str()) {
+            let _ = state.instances.delete(&iid);
+        }
+    }
+    Ok(())
+}
+
+/// Busca en Mojang un jugador por nombre o UUID antes de añadirlo.
+#[tauri::command]
+async fn admin_resolve_player(query: String) -> CmdResult<Player> {
+    Ok(events::resolve_player(&query).await?)
+}
+
+#[tauri::command]
+async fn admin_players_add(
     state: State<'_, AppState>,
-    instance_id: String,
-    file_name: String,
-    name: String,
-    description: Option<String>,
-) -> CmdResult<CatalogEntry> {
-    let id = InstanceId::parse(&instance_id)?;
-    let inst = state.instances.get(&id)?.instance;
-    let (base, client_id) = share_settings(&state)?;
-    let identity = share_identity(&state, &client_id).await?;
-    let dir = state.paths.instance_dir(&id).join("mods");
-    Ok(catalog::publish_mod(
-        &base,
-        &identity,
-        catalog::ModUpload {
-            mods_dir: &dir,
-            file_name: &file_name,
-            name: &name,
-            description: description.as_deref(),
-            minecraft_version: &inst.minecraft_version,
-            loader: inst.loader,
-        },
-    )
-    .await?)
+    id: String,
+    players: Vec<Player>,
+) -> CmdResult<Vec<Player>> {
+    with_event_session(&state, |s| {
+        let id = id.clone();
+        let players = players.clone();
+        async move { events::admin_add_players(&s, &id, &players).await }
+    })
+    .await
 }
 
 #[tauri::command]
-async fn catalog_delete(state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    let (base, client_id) = share_settings(&state)?;
-    let identity = share_identity(&state, &client_id).await?;
-    Ok(catalog::delete(&base, &identity, &id).await?)
-}
-
-#[tauri::command]
-async fn catalog_install_mod(
+async fn admin_player_remove(
     state: State<'_, AppState>,
-    instance_id: String,
-    file: CatalogFile,
-) -> CmdResult<String> {
-    let (base, _) = share_settings(&state)?;
-    let dir = mods_dir_for(&state, &instance_id)?;
-    Ok(catalog::install_mod(&base, &dir, &file).await?)
+    id: String,
+    uuid: String,
+) -> CmdResult<Vec<Player>> {
+    with_event_session(&state, |s| {
+        let id = id.clone();
+        let uuid = uuid.clone();
+        async move { events::admin_remove_player(&s, &id, &uuid).await }
+    })
+    .await
 }
-
-// ───────────────────────────── Fondo de instancia ─────────────────────────────
 
 #[derive(Serialize)]
 struct BackgroundView {
@@ -1497,31 +1110,6 @@ fn get_instance_background(state: State<'_, AppState>, instance_id: String) -> C
         mime,
         data_base64: BASE64.encode(bytes),
     }))
-}
-
-#[tauri::command]
-fn set_instance_background(
-    state: State<'_, AppState>,
-    instance_id: String,
-    mime: String,
-    data_base64: String,
-) -> CmdResult<()> {
-    let id = InstanceId::parse(&instance_id)?;
-    if data_base64.len() > MAX_BACKGROUND_B64 {
-        return Err(CommandError::new(
-            "la imagen supera el tamaño máximo admitido (15 MB)",
-        ));
-    }
-    let bytes = BASE64
-        .decode(data_base64.as_bytes())
-        .map_err(|e| CommandError::new(format!("imagen no válida: {e}")))?;
-    Ok(background::save(&state.paths.instance_dir(&id), &mime, &bytes)?)
-}
-
-#[tauri::command]
-fn clear_instance_background(state: State<'_, AppState>, instance_id: String) -> CmdResult<()> {
-    let id = InstanceId::parse(&instance_id)?;
-    Ok(background::clear(&state.paths.instance_dir(&id))?)
 }
 
 // ───────────────────────────── Fondo e icono del launcher ─────────────────────────────
@@ -1660,8 +1248,30 @@ fn emit_state(app: &AppHandle, id: &str, state: &'static str, message: Option<St
     );
 }
 
-/// Prepara (descarga/verifica) y lanza. Devuelve el código de salida del juego.
-async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>, CoreError> {
+/// Reporter que emite `install-progress` para la instancia `id`.
+fn progress_reporter(app: &AppHandle, id: &str) -> Reporter {
+    let progress_app = app.clone();
+    let progress_id = id.to_owned();
+    Reporter::new(move |p| {
+        let _ = progress_app.emit(
+            "install-progress",
+            ProgressEvent {
+                id: &progress_id,
+                phase: p.phase,
+                done: p.done,
+                total: p.total,
+            },
+        );
+    })
+}
+
+/// Prepara (descarga/verifica) y lanza, entrando directamente a `server`.
+/// Devuelve el código de salida del juego.
+async fn prepare_and_run(
+    app: &AppHandle,
+    id: &InstanceId,
+    server: Option<&str>,
+) -> Result<Option<i32>, CoreError> {
     let state = app.state::<AppState>();
     let view = state.instances.get(id)?;
     let instance = view.instance;
@@ -1672,19 +1282,7 @@ async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>
         .clone();
 
     let id_str = id.to_string();
-    let progress_app = app.clone();
-    let progress_id = id_str.clone();
-    let reporter = Reporter::new(move |p| {
-        let _ = progress_app.emit(
-            "install-progress",
-            ProgressEvent {
-                id: &progress_id,
-                phase: p.phase,
-                done: p.done,
-                total: p.total,
-            },
-        );
-    });
+    let reporter = progress_reporter(app, &id_str);
 
     let prepared = state
         .installer
@@ -1699,10 +1297,14 @@ async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>
     let runtime = java::ensure_for_meta(&state.paths, &instance.java, &prepared.meta, &reporter)
         .await?;
 
-    // La cuenta local no toca la red. La de Microsoft renueva su sesión real
-    // antes de lanzar; sin cuenta guardada se mantiene el modo demo oficial.
+    // Cliente privado: solo cuentas de Microsoft (la whitelist va por UUID real).
+    // Ni cuentas locales ni modo demo.
     let launch_auth = match state.auth_store.cached_account() {
-        Some(account) if account.kind == AccountKind::Offline => LaunchAuth::offline(&account),
+        Some(account) if account.kind == AccountKind::Offline => {
+            return Err(CoreError::Auth(
+                "Obsidia Eventos solo admite cuentas de Microsoft; cierra la sesión local.".into(),
+            ));
+        }
         Some(_) => {
             let client_id = settings.account.microsoft_client_id.clone().unwrap_or_default();
             let ep = AuthEndpoints::live();
@@ -1722,7 +1324,9 @@ async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>
                 }
             }
         }
-        None => LaunchAuth::demo(),
+        None => {
+            return Err(CoreError::Auth("inicia sesión con tu cuenta de Microsoft".into()));
+        }
     };
 
     let game_dir = state.paths.instance_dir(id);
@@ -1749,6 +1353,7 @@ async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>
             height: settings.minecraft.height,
             fullscreen: settings.minecraft.fullscreen,
         },
+        server,
     })?;
 
     state.instances.touch_last_played(id)?;
@@ -1787,32 +1392,6 @@ async fn prepare_and_run(app: &AppHandle, id: &InstanceId) -> Result<Option<i32>
     // haya forzado el cierre: la sesión ocurrió de verdad de todos modos.
     state.instances.add_playtime(id, started_at.elapsed().as_secs())?;
     outcome
-}
-
-/// Inicia preparación + lanzamiento en segundo plano. El progreso llega por eventos.
-#[tauri::command]
-fn play_instance(app: AppHandle, state: State<'_, AppState>, id: String) -> CmdResult<()> {
-    let id = InstanceId::parse(&id)?;
-    {
-        let mut games = state.games()?;
-        if games.contains_key(id.as_str()) {
-            return Err(CommandError::new("esta instancia ya se está preparando o ejecutando"));
-        }
-        games.insert(id.to_string(), GameSlot::Preparing);
-    }
-    emit_state(&app, id.as_str(), "preparing", None, None);
-
-    tauri::async_runtime::spawn(async move {
-        let result = prepare_and_run(&app, &id).await;
-        if let Ok(mut games) = app.state::<AppState>().games.lock() {
-            games.remove(id.as_str());
-        }
-        match result {
-            Ok(code) => emit_state(&app, id.as_str(), "stopped", None, code),
-            Err(e) => emit_state(&app, id.as_str(), "error", Some(e.to_string()), None),
-        }
-    });
-    Ok(())
 }
 
 #[tauri::command]
@@ -2177,6 +1756,7 @@ pub fn run() {
                 news: Mutex::new(None),
                 news_http: news_client()?,
                 mc_token: Mutex::new(None),
+                event_session: Mutex::new(None),
             });
             // `bundle.icon` empieza por `icons/icon.png` (512×512), así que este
             // es el icono de Halloween que Tauri incrusta para la ventana. Si el
@@ -2249,7 +1829,6 @@ pub fn run() {
             get_sign_in_code,
             begin_sign_in,
             begin_legacy_sign_in,
-            sign_in_offline,
             cancel_sign_in,
             sign_out,
             open_url,
@@ -2260,42 +1839,22 @@ pub fn run() {
             list_java_runtimes,
             list_minecraft_versions,
             list_instances,
-            create_instance,
-            update_instance,
-            delete_instance,
-            select_instance,
-            list_mods,
-            set_mod_enabled,
-            delete_mod,
-            import_mods,
             open_instance_folder,
             get_instance_background,
-            set_instance_background,
-            clear_instance_background,
             get_launcher_background,
             set_launcher_background,
             clear_launcher_background,
             get_launcher_icon,
             set_launcher_icon,
             clear_launcher_icon,
-            fetch_share_manifest,
-            import_from_code,
-            export_manifest_template,
-            export_share_code,
-            upload_share_pack,
-            modrinth_search,
-            modrinth_installed,
-            modrinth_install_mod,
-            modpack_versions,
-            modpack_preview_version,
-            modpack_preview_file,
-            modpack_install,
-            catalog_list,
-            catalog_publish_pack,
-            catalog_publish_mod,
-            catalog_delete,
-            catalog_install_mod,
-            play_instance,
+            events_me,
+            event_play,
+            admin_events_list,
+            admin_event_save,
+            admin_event_delete,
+            admin_resolve_player,
+            admin_players_add,
+            admin_player_remove,
             stop_instance,
             game_states,
             fetch_news,

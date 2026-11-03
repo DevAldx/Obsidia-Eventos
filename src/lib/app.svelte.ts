@@ -2,8 +2,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api } from "./api";
 import { accentColors } from "./color";
 import type {
-  Account, AppInfo, AuthStateEvent, GameState, GameStateEvent, ImportStateEvent, Instance,
-  InstanceList, InstanceManifest, JavaRuntime, LogEvent, ProgressEvent, Settings,
+  Account, AppInfo, AuthStateEvent, GameState, GameStateEvent, InstanceList, JavaRuntime,
+  LogEvent, MyEvents, ProgressEvent, Settings,
 } from "./types";
 
 const MAX_LOG_LINES = 1500;
@@ -24,15 +24,10 @@ class AppState {
   errors = $state<Record<string, string>>({});
   logs = $state<Record<string, LogEvent[]>>({});
 
-  // Importar por código.
-  importBusy = $state(false);
-  importError = $state<string | null>(null);
-  importedId = $state<string | null>(null);
-
-  // Cuenta local sin Microsoft/Azure.
-  localSignInOpen = $state(false);
-  localSignInBusy = $state(false);
-  localSignInError = $state<string | null>(null);
+  // Eventos: lo que el servidor deja ver a esta cuenta (whitelist).
+  me = $state<MyEvents | null>(null);
+  eventsLoading = $state(false);
+  eventsError = $state<string | null>(null);
 
   // Cuenta de Microsoft.
   account = $state<Account | null>(null);
@@ -42,9 +37,8 @@ class AppState {
   /** `true` mientras el diálogo usa el flujo heredado (no oficial). */
   signInLegacy = $state(false);
 
-  selected = $derived<Instance | null>(
-    this.list.instances.find((i) => i.id === this.settings?.selected_instance) ?? null,
-  );
+  /** ¿Puede jugar? Solo con cuenta de Microsoft. */
+  hasMicrosoft = $derived(this.account?.kind === "microsoft");
 
   /** `data:` URL por instancia; ausente = sin cargar, `null` = sin fondo propio. */
   backgrounds = $state<Record<string, string | null>>({});
@@ -115,28 +109,16 @@ class AppState {
         listen<ProgressEvent>("install-progress", (e) => (this.progress[e.payload.id] = e.payload)),
         listen<LogEvent>("game-log", (e) => this.onLog(e.payload)),
         listen<AuthStateEvent>("auth-state", (e) => this.onAuthState(e.payload)),
-        listen<ImportStateEvent>("import-state", (e) => this.onImportState(e.payload)),
       ]);
       [this.settings, this.info, this.list, this.account] = await Promise.all([
         api.getSettings(), api.appInfo(), api.listInstances(), api.getAccount(),
       ]);
-      // Al copiar una instancia a otro PC, `settings.json` no viaja con ella y
-      // no hay ninguna seleccionada. Elegir la más reciente evita que Inicio
-      // parezca vacío o que haya que «configurar» algo antes de jugar.
-      const selected = this.list.instances.some(
-        (i) => i.id === this.settings?.selected_instance,
-      );
-      if (!selected && this.list.instances.length > 0) {
-        const newest = [...this.list.instances].sort(
-          (a, b) => (b.last_played ?? 0) - (a.last_played ?? 0),
-        )[0];
-        if (newest) await this.select(newest.id);
-      }
       const running = await api.gameStates();
       for (const [id, s] of Object.entries(running)) this.games[id] = s as GameState;
       this.ready = true;
       void this.loadLauncherAppearance();
       void this.detectJava();
+      void this.loadEvents();
     } catch (e) {
       this.fatal = e instanceof Error ? e.message : String(e);
     }
@@ -152,6 +134,7 @@ class AppState {
       delete this.progress[ev.id];
       if (ev.state === "error" && ev.message) {
         this.errors[ev.id] = ev.message;
+        void this.loadEvents(); // p. ej. «ya no tienes acceso a este evento»
         // Si la sesión de Microsoft caducó, Rust borra el perfil cacheado;
         // refrescarlo evita seguir mostrando «conectado».
         void this.refreshAccount();
@@ -179,6 +162,7 @@ class AppState {
     this.signInBusy = false;
     if (ev.state === "success") {
       this.account = ev.account;
+      void this.loadEvents();
       this.signIn = null;
       this.signInError = null;
       this.signInLegacy = false;
@@ -193,41 +177,21 @@ class AppState {
     }
   }
 
-  private onImportState(ev: ImportStateEvent) {
-    this.importBusy = false;
-    if (ev.state === "success") {
-      this.importError = null;
-      this.importedId = ev.instance_id;
-      void this.refreshInstances();
-      void this.detectJava(); // puede haberse instalado un JRE nuevo
-    } else {
-      this.importError = ev.message;
+  /** Pide al servidor los eventos de esta cuenta (vacío = fuera de la whitelist). */
+  async loadEvents() {
+    if (this.account?.kind !== "microsoft") {
+      this.me = null;
+      this.eventsError = null;
+      return;
     }
-  }
-
-  async importFromCode(manifest: InstanceManifest) {
-    this.importBusy = true;
-    this.importError = null;
-    this.importedId = null;
+    this.eventsLoading = true;
+    this.eventsError = null;
     try {
-      await api.importFromCode(manifest);
-      // el resultado llega por el evento `import-state`
+      this.me = await api.eventsMe();
     } catch (e) {
-      this.importBusy = false;
-      this.importError = e instanceof Error ? e.message : String(e);
-    }
-  }
-
-  /** Instala un modpack ya previsualizado; el resultado llega por `import-state`. */
-  async installModpack(token: string) {
-    this.importBusy = true;
-    this.importError = null;
-    this.importedId = null;
-    try {
-      await api.modpackInstall(token);
-    } catch (e) {
-      this.importBusy = false;
-      this.importError = e instanceof Error ? e.message : String(e);
+      this.eventsError = e instanceof Error ? e.message : String(e);
+    } finally {
+      this.eventsLoading = false;
     }
   }
 
@@ -263,18 +227,10 @@ class AppState {
     this.settings = await api.saveSettings(next);
   }
 
-  async select(id: string | null) {
-    try {
-      this.settings = await api.selectInstance(id);
-    } catch (e) {
-      console.error("no se pudo seleccionar la instancia", e);
-    }
-  }
-
   async play(id: string) {
     try {
       delete this.errors[id];
-      await api.play(id);
+      await api.eventPlay(id);
     } catch (e) {
       this.errors[id] = e instanceof Error ? e.message : String(e);
       void this.refreshAccount();
@@ -322,33 +278,6 @@ class AppState {
     }
   }
 
-  openLocalSignIn() {
-    // Una cuenta local y un inicio de sesión de Microsoft no deben competir:
-    // si hay uno de Microsoft en curso, se cancela al abrir este diálogo.
-    if (this.signInBusy) void this.cancelSignIn();
-    this.localSignInError = null;
-    this.localSignInOpen = true;
-  }
-
-  closeLocalSignIn() {
-    if (this.localSignInBusy) return;
-    this.localSignInOpen = false;
-    this.localSignInError = null;
-  }
-
-  async signInOffline(username: string) {
-    this.localSignInBusy = true;
-    this.localSignInError = null;
-    try {
-      this.account = await api.signInOffline(username);
-      this.localSignInOpen = false;
-    } catch (e) {
-      this.localSignInError = e instanceof Error ? e.message : String(e);
-    } finally {
-      this.localSignInBusy = false;
-    }
-  }
-
   async cancelSignIn() {
     this.signIn = null;
     this.signInBusy = false;
@@ -364,6 +293,7 @@ class AppState {
   async signOut() {
     await api.signOut();
     this.account = null;
+    this.me = null;
   }
 }
 

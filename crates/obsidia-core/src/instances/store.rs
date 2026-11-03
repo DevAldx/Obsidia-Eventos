@@ -108,6 +108,36 @@ impl InstanceStore {
             found.ok_or_else(|| CoreError::invalid("no se pudo generar un ID único"))?
         };
 
+        self.build(id, dir, input)
+    }
+
+    /// Crea una instancia con un ID fijo (el de un evento). Falla si ya existe.
+    pub fn create_with_id(&self, id: InstanceId, input: NewInstance) -> Result<InstanceView> {
+        let input = input.validated()?;
+        filesystem::create_dir_all(&self.paths.instances_dir())?;
+        let dir = self.paths.instance_dir(&id);
+        fs::create_dir(&dir).map_err(|e| CoreError::io(dir.clone(), e))?;
+        self.build(id, dir, input)
+    }
+
+    /// Ajusta nombre, versión, loader y memoria a lo que manda el evento. Solo
+    /// para instancias de evento: en las normales la versión no cambia nunca.
+    pub fn sync_event_definition(&self, id: &InstanceId, def: NewInstance) -> Result<InstanceView> {
+        if !id.is_event() {
+            return Err(CoreError::invalid("solo se sincronizan instancias de evento"));
+        }
+        let def = def.validated()?;
+        let mut instance = self.load(id)?;
+        instance.name = def.name;
+        instance.minecraft_version = def.minecraft_version;
+        instance.loader = def.loader;
+        instance.loader_version = def.loader_version;
+        instance.memory = def.memory;
+        self.save(&instance)?;
+        self.view(instance)
+    }
+
+    fn build(&self, id: InstanceId, dir: std::path::PathBuf, input: NewInstance) -> Result<InstanceView> {
         let instance = Instance {
             schema_version: INSTANCE_SCHEMA_VERSION,
             id,

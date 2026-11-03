@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Obsidia",
-  "version": "0.5.0",
-  "identifier": "dev.obsidia.launcher",
+  "productName": "Obsidia Eventos",
+  "version": "0.1.0",
+  "identifier": "dev.obsidia.eventos",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "splash",
-        "title": "Obsidia",
+        "title": "Obsidia Eventos",
         "url": "index.html",
         "width": 620,
         "height": 380,
@@ -30,7 +30,7 @@
       },
       {
         "label": "main",
-        "title": "Obsidia",
+        "title": "Obsidia Eventos",
         "width": 1180,
         "height": 720,
         "minWidth": 940,
@@ -42,7 +42,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: https://textures.minecraft.net https://launchercontent.mojang.com https://cdn.modrinth.com https://obsidia-share.obsidia-share.workers.dev; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+      "csp": "default-src 'self'; img-src 'self' data: https://textures.minecraft.net https://launchercontent.mojang.com; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {
@@ -59,15 +59,15 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "shortDescription": "Obsidia: launcher de Minecraft ligero"
+    "shortDescription": "Obsidia Eventos: cliente privado de Minecraft para eventos"
   },
   "plugins": {
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMxMUM1NTdGMURDNDk4RDIKUldUU21NUWRmMVVjTWViSFMwSUwyNDRaazBZczM4dVMwR3dNMmdPankxckRDN0phTXBZNkl3eE8K",
       "endpoints": [
-        "https://github.com/DevAldx/Obsidia/releases/latest/download/latest.json"
+        "https://github.com/DevAldx/Obsidia-Eventos/releases/latest/download/latest.json"
       ]
     }
   },
-  "mainBinaryName": "obsidia"
+  "mainBinaryName": "obsidia-eventos"
 }

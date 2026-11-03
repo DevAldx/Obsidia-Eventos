@@ -1,20 +1,31 @@
-// Servidor para compartir instancias de Obsidia (Cloudflare Worker + R2).
+// Servidor de Obsidia Eventos (Cloudflare Worker + KV/R2).
 //
-// Rutas públicas (las usa quien importa):
-//   GET  /OBS-XXXXXX.json        manifiesto del pack (el formato que ya lee el launcher)
-//   GET  /files/<sha1>           archivo subido (mod, imagen, config…)
+// Es un cliente privado: solo entra quien está en la whitelist de algún
+// evento. La whitelist vive AQUÍ, no en el launcher, así que modificar el
+// launcher no sirve para colarse: sin estar en la lista, el servidor no
+// entrega ni la dirección del servidor de Minecraft ni el pack.
 //
-// Rutas con sesión (las usa quien comparte):
+// Sesión (cualquier cuenta de Minecraft real):
 //   POST /api/challenge          -> { serverId, ticket }
-//   POST /api/login              { username, ticket } -> { token, uuid, name }
-//   PUT  /api/files/<sha1>       cuerpo = bytes del archivo
-//   POST /api/packs              cuerpo = manifiesto JSON -> { code }
-//   DELETE /api/packs/<code>     solo el dueño
+//   POST /api/login              { uuid, ticket, publicKey, ... } -> { token, uuid }
 //
-// Catálogo comunitario (packs y mods que publican los jugadores):
-//   GET    /api/catalog          -> { items: [...] } (público)
-//   POST   /api/catalog          { kind: "pack", code } | { kind: "mod", name, file, ... }
-//   DELETE /api/catalog/<id>     el dueño o un admin (ADMIN_UUIDS)
+// Jugadores (con sesión):
+//   GET  /api/events             -> { uuid, admin, events } solo los eventos donde está en la whitelist
+//
+// Administración (UUID en ADMIN_UUIDS):
+//   GET    /api/admin/events                      todos los eventos con su whitelist
+//   POST   /api/admin/events                      crear evento
+//   PUT    /api/admin/events/<EVT-XXXXXX>         editar evento
+//   DELETE /api/admin/events/<EVT-XXXXXX>         borrar evento
+//   POST   /api/admin/events/<id>/players         { players: [{ uuid, name }] } añadir a la whitelist
+//   DELETE /api/admin/events/<id>/players/<uuid>  quitar de la whitelist
+//   PUT    /api/files/<sha1>, POST /api/packs     subir el pack del evento (desde Obsidia normal)
+//   DELETE /api/packs/<code>
+//
+// Servidor de Minecraft (clave SERVER_KEY):
+//   GET  /api/server/<EVT-XXXXXX>/whitelist.json  la whitelist en el formato de Minecraft
+//
+// Archivos: GET /files/<sha1> (la ruta es el propio hash, imposible de adivinar).
 //
 // Inicio de sesión: con el certificado de jugador de Mojang (el par de claves
 // que Minecraft usa para firmar el chat). Mojang firma la clave pública de cada
@@ -41,12 +52,15 @@ const MAX_MANIFEST_FILES = 512;
 const CHALLENGE_TTL_S = 120;
 const TOKEN_TTL_S = 60 * 60;
 const FILE_LISTS = ["mods", "resourcepacks", "shaderpacks", "config_files"];
-const CATALOG_KEY = "catalog/index.json";
-const CATALOG_MAX_ITEMS = 2000;
-const CATALOG_MAX_PER_USER = 50;
-const CATALOG_ID_RE = /^[a-z0-9]{10}$/;
+const EVENTS_KEY = "events/index.json";
+const EVENT_ID_RE = /^EVT-[A-Z0-9]{6}$/;
+const MAX_EVENTS = 100;
+const MAX_PLAYERS_PER_EVENT = 2000;
 const MC_NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
 const MC_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+const LOADER_VERSION_RE = /^[A-Za-z0-9._-]{1,32}$/;
+// host o host:puerto (sin esquema).
+const SERVER_ADDRESS_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$/;
 
 const enc = new TextEncoder();
 
@@ -132,19 +146,10 @@ async function route(request, env) {
   const method = request.method;
 
   if (path === "/" && method === "GET") {
-    return json({ service: "obsidia-share", version: 1 });
+    return json({ service: "obsidia-eventos", version: 1 });
   }
 
-  let m = path.match(/^\/(OBS-[A-Z0-9]{6})\.json$/);
-  if (m && (method === "GET" || method === "HEAD")) {
-    const obj = await env.BUCKET.get(`packs/${m[1]}.json`);
-    if (!obj) return json({ error: "no existe ningún pack con ese código" }, 404);
-    return new Response(method === "HEAD" ? null : obj.body, {
-      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "public, max-age=60" },
-    });
-  }
-
-  m = path.match(/^\/files\/([0-9a-f]{40})$/);
+  let m = path.match(/^\/files\/([0-9a-f]{40})$/);
   if (m && (method === "GET" || method === "HEAD")) {
     const key = `files/${m[1]}`;
     const obj = method === "HEAD" ? await env.BUCKET.head(key) : await env.BUCKET.get(key);
@@ -154,13 +159,18 @@ async function route(request, env) {
         "content-type": "application/octet-stream",
         "content-length": String(obj.size),
         // El contenido de una ruta es su propio hash: nunca cambia.
-        "cache-control": "public, max-age=31536000, immutable",
+        "cache-control": "private, max-age=31536000, immutable",
       },
     });
   }
 
   if (path === "/api/challenge" && method === "POST") return challenge(env);
   if (path === "/api/login" && method === "POST") return login(request, env);
+
+  if (path === "/api/events" && method === "GET") return listMyEvents(request, env);
+
+  m = path.match(/^\/api\/server\/(EVT-[A-Z0-9]{6})\/whitelist\.json$/);
+  if (m && method === "GET") return serverWhitelist(request, env, url, m[1]);
 
   m = path.match(/^\/api\/files\/([0-9a-f]{40})$/);
   if (m && method === "PUT") return uploadFile(request, env, m[1]);
@@ -170,10 +180,15 @@ async function route(request, env) {
   m = path.match(/^\/api\/packs\/(OBS-[A-Z0-9]{6})$/);
   if (m && method === "DELETE") return deletePack(request, env, m[1]);
 
-  if (path === "/api/catalog" && method === "GET") return listCatalog(env);
-  if (path === "/api/catalog" && method === "POST") return publishToCatalog(request, env, url.origin);
-  m = path.match(/^\/api\/catalog\/([a-z0-9]{10})$/);
-  if (m && method === "DELETE") return deleteFromCatalog(request, env, m[1]);
+  if (path === "/api/admin/events" && method === "GET") return adminListEvents(request, env);
+  if (path === "/api/admin/events" && method === "POST") return adminSaveEvent(request, env, null);
+  m = path.match(/^\/api\/admin\/events\/(EVT-[A-Z0-9]{6})$/);
+  if (m && method === "PUT") return adminSaveEvent(request, env, m[1]);
+  if (m && method === "DELETE") return adminDeleteEvent(request, env, m[1]);
+  m = path.match(/^\/api\/admin\/events\/(EVT-[A-Z0-9]{6})\/players$/);
+  if (m && method === "POST") return adminAddPlayers(request, env, m[1]);
+  m = path.match(/^\/api\/admin\/events\/(EVT-[A-Z0-9]{6})\/players\/([0-9a-fA-F-]{32,36})$/);
+  if (m && method === "DELETE") return adminRemovePlayer(request, env, m[1], m[2]);
 
   return json({ error: "ruta no encontrada" }, 404);
 }
@@ -306,7 +321,7 @@ const writeQuota = (env, q) => env.BUCKET.put(q.key, JSON.stringify(q.data));
 // ───────────────────────────── Archivos ─────────────────────────────
 
 async function uploadFile(request, env, sha1) {
-  const uuid = await requireUser(request, env);
+  const uuid = await requireAdmin(request, env);
   const lim = limits(env);
   const declared = Number(request.headers.get("content-length"));
   if (!(declared > 0)) throw new HttpError(411, "falta el tamaño del archivo");
@@ -362,7 +377,7 @@ async function checkFileUrl(env, origin, rawUrl, sha1, size) {
 }
 
 async function createPack(request, env, origin) {
-  const uuid = await requireUser(request, env);
+  const uuid = await requireAdmin(request, env);
   const lim = limits(env);
   const text = await request.text();
   if (text.length > MAX_MANIFEST_BYTES) throw new HttpError(413, "el manifiesto es demasiado grande");
@@ -428,141 +443,285 @@ async function createPack(request, env, origin) {
 }
 
 async function deletePack(request, env, code) {
-  const uuid = await requireUser(request, env);
+  const uuid = await requireAdmin(request, env);
   if (!CODE_RE.test(code)) throw new HttpError(400, "código inválido");
   const key = `packs/${code}.json`;
   const obj = await env.BUCKET.head(key);
   if (!obj) throw new HttpError(404, "no existe ningún pack con ese código");
-  if (obj.customMetadata?.owner !== uuid) throw new HttpError(403, "este pack no es tuyo");
+  const events = await readEvents(env);
+  if (events.items.some((e) => e.pack_code === code)) {
+    throw new HttpError(409, "un evento usa este pack; quítalo del evento antes de borrarlo");
+  }
   await env.BUCKET.delete(key);
-  // Un pack borrado tampoco debe seguir en el catálogo.
-  const catalog = await readCatalog(env);
-  const before = catalog.items.length;
-  catalog.items = catalog.items.filter((e) => e.code !== code);
-  if (catalog.items.length !== before) await writeCatalog(env, catalog);
   return new Response(null, { status: 204 });
 }
 
-// ───────────────────────────── Catálogo comunitario ─────────────────────────────
-//
-// Un único índice JSON (`catalog/index.json`), del más nuevo al más viejo. Vale
-// igual para KV y R2 sin depender de `list`. Con mucho tráfico simultáneo dos
-// publicaciones podrían pisarse; para un servidor de comunidad pequeño basta.
-
-async function readCatalog(env) {
-  const obj = await env.BUCKET.get(CATALOG_KEY);
-  if (!obj) return { items: [] };
-  const data = await obj.json().catch(() => null);
-  return Array.isArray(data?.items) ? data : { items: [] };
-}
-
-const writeCatalog = (env, catalog) => env.BUCKET.put(CATALOG_KEY, JSON.stringify(catalog));
-
-async function listCatalog(env) {
-  const catalog = await readCatalog(env);
-  return json(catalog, 200, { "cache-control": "public, max-age=30" });
-}
+// ───────────────────────────── Administradores ─────────────────────────────
 
 function isAdmin(env, uuid) {
   return String(env.ADMIN_UUIDS ?? "")
     .split(",")
     .map((u) => u.trim().replace(/-/g, "").toLowerCase())
+    .filter(Boolean)
     .includes(uuid);
+}
+
+async function requireAdmin(request, env) {
+  const uuid = await requireUser(request, env);
+  if (!isAdmin(env, uuid)) throw new HttpError(403, "solo los administradores del evento pueden hacer esto");
+  return uuid;
 }
 
 function cleanText(value, max) {
   if (value == null) return null;
   if (typeof value !== "string") throw new HttpError(400, "texto inválido");
   // eslint-disable-next-line no-control-regex
-  const t = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  const t = value.replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim();
   if (t.length > max) throw new HttpError(400, `el texto no puede pasar de ${max} caracteres`);
   return t || null;
 }
 
-function newCatalogId() {
-  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
-  return [...crypto.getRandomValues(new Uint8Array(10))].map((b) => alphabet[b % alphabet.length]).join("");
+const dashed = (u) => u.replace(/^(.{8})(.{4})(.{4})(.{4})(.{12})$/, "$1-$2-$3-$4-$5");
+
+// ───────────────────────────── Eventos ─────────────────────────────
+//
+// Un único índice JSON (`events/index.json`) con los eventos y su whitelist.
+// Sirve igual para KV y R2. Pensado para un equipo pequeño de admins: dos
+// cambios exactamente simultáneos podrían pisarse.
+
+async function readEvents(env) {
+  const obj = await env.BUCKET.get(EVENTS_KEY);
+  if (!obj) return { items: [] };
+  const data = await obj.json().catch(() => null);
+  return Array.isArray(data?.items) ? data : { items: [] };
 }
 
-async function publishToCatalog(request, env, origin) {
+const writeEvents = (env, events) => env.BUCKET.put(EVENTS_KEY, JSON.stringify(events));
+
+function findEvent(events, id) {
+  if (!EVENT_ID_RE.test(id)) throw new HttpError(400, "identificador de evento inválido");
+  const event = events.items.find((e) => e.id === id);
+  if (!event) throw new HttpError(404, "ese evento no existe");
+  return event;
+}
+
+async function readPack(env, code) {
+  const obj = await env.BUCKET.get(`packs/${code}.json`);
+  if (!obj) return null;
+  return obj.json().catch(() => null);
+}
+
+/** Lo que ve un jugador de la whitelist: incluye la dirección y el pack completo. */
+async function playerView(env, event) {
+  const pack = event.pack_code ? await readPack(env, event.pack_code) : null;
+  return {
+    id: event.id,
+    name: event.name,
+    description: event.description ?? null,
+    minecraft_version: event.minecraft_version,
+    loader: event.loader,
+    loader_version: event.loader_version ?? null,
+    server_address: event.server_address ?? null,
+    memory: event.memory ?? null,
+    image_url: event.image_url ?? null,
+    active: event.active !== false,
+    manifest: pack
+      ? {
+          code: event.id,
+          name: event.name,
+          description: event.description ?? null,
+          background_url: event.image_url ?? pack.background_url ?? null,
+          minecraft_version: event.minecraft_version,
+          loader: event.loader,
+          loader_version: event.loader_version ?? null,
+          java: pack.java ?? null,
+          memory: event.memory ?? pack.memory ?? null,
+          mods: pack.mods ?? [],
+          resourcepacks: pack.resourcepacks ?? [],
+          shaderpacks: pack.shaderpacks ?? [],
+          config_files: pack.config_files ?? [],
+        }
+      : null,
+    updated: event.updated ?? null,
+  };
+}
+
+async function listMyEvents(request, env) {
   const uuid = await requireUser(request, env);
+  const admin = isAdmin(env, uuid);
+  const events = await readEvents(env);
+  const mine = events.items.filter(
+    (e) => admin || (e.active !== false && (e.players ?? []).some((p) => p.uuid === uuid)),
+  );
+  return json(
+    { uuid, admin, events: await Promise.all(mine.map((e) => playerView(env, e))) },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+async function adminListEvents(request, env) {
+  await requireAdmin(request, env);
+  const events = await readEvents(env);
+  return json({ events: events.items }, 200, { "cache-control": "no-store" });
+}
+
+function parseMemory(value) {
+  if (value == null) return null;
+  const min = Number(value.min_mb);
+  const max = Number(value.max_mb);
+  if (!Number.isInteger(min) || !Number.isInteger(max) || min < 512 || max < min || max > 65536) {
+    throw new HttpError(400, "memoria inválida (mínimo 512 MB y máximo ≥ mínimo)");
+  }
+  return { min_mb: min, max_mb: max };
+}
+
+function newEventId() {
+  const rnd = crypto.getRandomValues(new Uint8Array(6));
+  return `EVT-${[...rnd].map((b) => CODE_ALPHABET[b % CODE_ALPHABET.length]).join("")}`;
+}
+
+async function adminSaveEvent(request, env, id) {
+  const uuid = await requireAdmin(request, env);
   const body = await request.json().catch(() => null);
   if (typeof body !== "object" || body === null) throw new HttpError(400, "petición inválida");
-  const author = String(body.author ?? "");
-  if (!MC_NAME_RE.test(author)) throw new HttpError(400, "nombre de autor inválido");
-  const description = cleanText(body.description, 300);
+  const events = await readEvents(env);
 
-  const catalog = await readCatalog(env);
-  if (catalog.items.length >= CATALOG_MAX_ITEMS) throw new HttpError(507, "el catálogo está lleno");
-  if (catalog.items.filter((e) => e.owner === uuid).length >= CATALOG_MAX_PER_USER) {
-    throw new HttpError(429, `ya tienes ${CATALOG_MAX_PER_USER} publicaciones; borra alguna antes`);
-  }
-  const quota = await readQuota(env, uuid);
-  if (quota.data.packs >= limits(env).dailyPacks) throw new HttpError(429, "has alcanzado el límite de publicaciones de hoy");
-
-  let entry;
-  if (body.kind === "pack") {
-    const code = String(body.code ?? "");
-    if (!CODE_RE.test(code)) throw new HttpError(400, "código inválido");
-    const obj = await env.BUCKET.get(`packs/${code}.json`);
-    if (!obj) throw new HttpError(404, "no existe ningún pack con ese código");
-    if (obj.customMetadata?.owner !== uuid) throw new HttpError(403, "solo puedes publicar tus propios packs");
-    if (catalog.items.some((e) => e.code === code)) throw new HttpError(409, "este pack ya está publicado");
-    const manifest = await obj.json();
-    entry = {
-      kind: "pack",
-      name: manifest.name,
-      description: description ?? manifest.description ?? null,
-      minecraft_version: manifest.minecraft_version,
-      loader: manifest.loader,
-      loader_version: manifest.loader_version ?? null,
-      code,
-      image_url: manifest.background_url ?? null,
-      mod_count: Array.isArray(manifest.mods) ? manifest.mods.length : 0,
-    };
-  } else if (body.kind === "mod") {
-    const name = cleanText(body.name, 48);
-    if (!name) throw new HttpError(400, "falta el nombre del mod");
-    if (typeof body.minecraft_version !== "string" || !MC_VERSION_RE.test(body.minecraft_version)) {
-      throw new HttpError(400, "versión de Minecraft inválida");
-    }
-    if (body.loader !== "fabric") throw new HttpError(400, "loader inválido");
-    const f = body.file ?? {};
-    if (!validFileName(f.file_name, "mods")) throw new HttpError(400, "nombre de archivo inválido");
-    if (typeof f.sha1 !== "string" || !SHA1_RE.test(f.sha1)) throw new HttpError(400, "SHA-1 inválido");
-    if (!Number.isInteger(f.size) || f.size <= 0) throw new HttpError(400, "tamaño inválido");
-    if (!(await checkFileUrl(env, origin, `${origin}/files/${f.sha1}`, f.sha1, f.size))) {
-      throw new HttpError(400, "el archivo no se ha subido a este servidor");
-    }
-    if (catalog.items.some((e) => e.file?.sha1 === f.sha1)) throw new HttpError(409, "este mod ya está publicado");
-    entry = {
-      kind: "mod",
-      name,
-      description,
-      minecraft_version: body.minecraft_version,
-      loader: "fabric",
-      file: { file_name: f.file_name, sha1: f.sha1, size: f.size },
-    };
+  let event;
+  if (id) {
+    event = findEvent(events, id);
   } else {
-    throw new HttpError(400, "tipo de publicación inválido");
+    if (events.items.length >= MAX_EVENTS) throw new HttpError(507, `no se pueden tener más de ${MAX_EVENTS} eventos`);
+    let fresh = newEventId();
+    while (events.items.some((e) => e.id === fresh)) fresh = newEventId();
+    event = { id: fresh, players: [], created: new Date().toISOString(), created_by: uuid };
+    events.items.unshift(event);
   }
 
-  entry = { id: newCatalogId(), ...entry, author, owner: uuid, created: new Date().toISOString() };
-  catalog.items.unshift(entry);
-  await writeCatalog(env, catalog);
-  quota.data.packs += 1;
-  await writeQuota(env, quota);
-  return json(entry, 201);
+  const name = cleanText(body.name, 48);
+  if (!name) throw new HttpError(400, "falta el nombre del evento");
+  const description = cleanText(body.description, 600);
+
+  const serverAddress = cleanText(body.server_address, 260);
+  if (serverAddress) {
+    const port = Number(serverAddress.split(":")[1] ?? 25565);
+    if (!SERVER_ADDRESS_RE.test(serverAddress) || !(port >= 1 && port <= 65535)) {
+      throw new HttpError(400, "dirección del servidor inválida (usa host o host:puerto)");
+    }
+  }
+
+  let imageUrl = cleanText(body.image_url, 500);
+  if (imageUrl) {
+    let u;
+    try {
+      u = new URL(imageUrl);
+    } catch {
+      throw new HttpError(400, "la URL de la imagen no es válida");
+    }
+    if (u.protocol !== "https:") throw new HttpError(400, "la imagen debe ser https");
+  }
+
+  // Con pack, la versión y el loader salen del pack (no pueden no coincidir).
+  const packCode = cleanText(body.pack_code, 16)?.toUpperCase() ?? null;
+  let version, loader, loaderVersion;
+  if (packCode) {
+    if (!CODE_RE.test(packCode)) throw new HttpError(400, "código de pack inválido (OBS-XXXXXX)");
+    const pack = await readPack(env, packCode);
+    if (!pack) throw new HttpError(404, "ese pack no existe en este servidor; súbelo antes desde Obsidia");
+    version = pack.minecraft_version;
+    loader = pack.loader;
+    loaderVersion = pack.loader_version ?? null;
+    imageUrl = imageUrl ?? pack.background_url ?? null;
+  } else {
+    version = String(body.minecraft_version ?? "");
+    loader = body.loader ?? "vanilla";
+    loaderVersion = body.loader_version ?? null;
+  }
+  if (!MC_VERSION_RE.test(version)) throw new HttpError(400, "versión de Minecraft inválida");
+  if (!["vanilla", "fabric"].includes(loader)) throw new HttpError(400, "loader inválido");
+  if (loader === "fabric" && !(typeof loaderVersion === "string" && LOADER_VERSION_RE.test(loaderVersion))) {
+    throw new HttpError(400, "falta la versión de Fabric Loader");
+  }
+  if (loader === "vanilla") loaderVersion = null;
+
+  Object.assign(event, {
+    name,
+    description,
+    server_address: serverAddress,
+    image_url: imageUrl,
+    pack_code: packCode,
+    minecraft_version: version,
+    loader,
+    loader_version: loaderVersion,
+    memory: parseMemory(body.memory),
+    active: body.active !== false,
+    updated: new Date().toISOString(),
+  });
+  await writeEvents(env, events);
+  return json(event, id ? 200 : 201);
 }
 
-async function deleteFromCatalog(request, env, id) {
-  const uuid = await requireUser(request, env);
-  if (!CATALOG_ID_RE.test(id)) throw new HttpError(400, "identificador inválido");
-  const catalog = await readCatalog(env);
-  const entry = catalog.items.find((e) => e.id === id);
-  if (!entry) throw new HttpError(404, "esa publicación no existe");
-  if (entry.owner !== uuid && !isAdmin(env, uuid)) throw new HttpError(403, "esta publicación no es tuya");
-  catalog.items = catalog.items.filter((e) => e.id !== id);
-  await writeCatalog(env, catalog);
+async function adminDeleteEvent(request, env, id) {
+  await requireAdmin(request, env);
+  const events = await readEvents(env);
+  findEvent(events, id);
+  events.items = events.items.filter((e) => e.id !== id);
+  await writeEvents(env, events);
   return new Response(null, { status: 204 });
+}
+
+async function adminAddPlayers(request, env, id) {
+  const admin = await requireAdmin(request, env);
+  const body = await request.json().catch(() => null);
+  const list = Array.isArray(body?.players) ? body.players : null;
+  if (!list || list.length === 0 || list.length > 500) throw new HttpError(400, "envía entre 1 y 500 jugadores");
+  const events = await readEvents(env);
+  const event = findEvent(events, id);
+  event.players ??= [];
+  for (const p of list) {
+    const uuid = String(p?.uuid ?? "").replace(/-/g, "").toLowerCase();
+    const name = String(p?.name ?? "");
+    if (!UUID_RE.test(uuid)) throw new HttpError(400, `UUID inválido: ${p?.uuid}`);
+    if (!MC_NAME_RE.test(name)) throw new HttpError(400, `nombre inválido: ${name}`);
+    const existing = event.players.find((x) => x.uuid === uuid);
+    if (existing) existing.name = name;
+    else event.players.push({ uuid, name, added: new Date().toISOString(), added_by: admin });
+  }
+  if (event.players.length > MAX_PLAYERS_PER_EVENT) {
+    throw new HttpError(507, `un evento no puede tener más de ${MAX_PLAYERS_PER_EVENT} jugadores`);
+  }
+  event.updated = new Date().toISOString();
+  await writeEvents(env, events);
+  return json({ players: event.players });
+}
+
+async function adminRemovePlayer(request, env, id, rawUuid) {
+  await requireAdmin(request, env);
+  const uuid = rawUuid.replace(/-/g, "").toLowerCase();
+  if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
+  const events = await readEvents(env);
+  const event = findEvent(events, id);
+  event.players = (event.players ?? []).filter((p) => p.uuid !== uuid);
+  event.updated = new Date().toISOString();
+  await writeEvents(env, events);
+  return json({ players: event.players });
+}
+
+// ───────────────────────────── Servidor de Minecraft ─────────────────────────────
+//
+// El launcher no basta para proteger un evento: cualquiera que conozca la IP
+// podría entrar con otro launcher. El servidor de Minecraft debe tener su
+// propia whitelist; esta ruta se la da ya hecha (formato `whitelist.json`)
+// para sincronizarla con un cron o un plugin.
+
+async function serverWhitelist(request, env, url, id) {
+  const expected = String(env.SERVER_KEY ?? "");
+  if (expected.length < 24) throw new HttpError(503, "falta configurar SERVER_KEY (wrangler secret put SERVER_KEY)");
+  const auth = request.headers.get("authorization") ?? "";
+  const given = auth.startsWith("Bearer ") ? auth.slice(7) : (url.searchParams.get("key") ?? "");
+  if (!safeEqual(given, expected)) throw new HttpError(401, "clave de servidor incorrecta");
+  const events = await readEvents(env);
+  const event = findEvent(events, id);
+  const list = (event.players ?? []).map((p) => ({ uuid: dashed(p.uuid), name: p.name }));
+  return json(list, 200, { "cache-control": "no-store" });
 }

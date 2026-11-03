@@ -64,27 +64,6 @@ export interface InstanceList {
   broken: { id: string; error: string }[];
 }
 
-export interface NewInstance {
-  name: string;
-  minecraft_version: string;
-  loader: Loader;
-  memory: Memory;
-  jvm_args: string[];
-}
-
-export interface ModEntry {
-  file_name: string;
-  enabled: boolean;
-  size_bytes: number;
-}
-
-export interface UpdateInstance {
-  name?: string;
-  memory?: Memory;
-  jvm_args?: string[];
-  java?: JavaChoice;
-}
-
 export interface AppInfo {
   version: string;
   data_dir: string;
@@ -197,38 +176,7 @@ export interface InstanceManifest {
 }
 
 /** Resultado de generar un código `OBS1-…` autocontenido. */
-export interface ExportedCode {
-  code: string;
-  /** Archivos encontrados en Modrinth que viajan en el código. */
-  included: number;
-  /** Archivos que no están en Modrinth y no se incluyen. */
-  missing: string[];
-}
-
 /** Resultado de subir una instancia al servidor para compartir. */
-export interface UploadedPack {
-  code: string;
-  from_modrinth: number;
-  hosted: number;
-  uploaded_bytes: number;
-  has_background: boolean;
-}
-
-export interface ShareProgressEvent {
-  instance_id: string;
-  phase: string;
-  done: number;
-  total: number;
-}
-
-export type ImportState = "success" | "error";
-
-export interface ImportStateEvent {
-  state: ImportState;
-  instance_id: string | null;
-  message: string | null;
-}
-
 export type NewsKind = "news" | "release" | "snapshot";
 
 export interface NewsItem {
@@ -281,93 +229,60 @@ export interface LibrarySkin {
 
 // ───── Modrinth ─────
 
-export type ProjectType = "mod" | "modpack" | "resourcepack" | "shader";
-export type SearchSort = "relevance" | "downloads" | "follows" | "newest" | "updated";
+// ───────────────────────────── Eventos ─────────────────────────────
 
-export interface SearchQuery {
-  query: string;
-  project_type: ProjectType;
-  game_version?: string | null;
-  loader?: Loader | null;
-  offset?: number;
-  limit?: number;
-  sort?: SearchSort;
-}
-
-export interface SearchHit {
-  project_id: string;
-  slug: string;
-  title: string;
-  description: string;
-  author: string;
-  icon_url: string | null;
-  downloads: number;
-  follows: number;
-  display_categories: string[];
-  date_modified: string | null;
-  featured_gallery: string | null;
-}
-
-export interface SearchResults {
-  hits: SearchHit[];
-  offset: number;
-  limit: number;
-  total_hits: number;
-}
-
-export interface MrVersion {
+export interface EventInfo {
   id: string;
-  project_id: string;
-  name: string;
-  version_number: string;
-  version_type: string;
-  game_versions: string[];
-  loaders: string[];
-  date_published: string;
-}
-
-export interface InstallOutcome {
-  installed: { project_id: string; file_name: string; requested: boolean }[];
-  missing_dependencies: string[];
-}
-
-export interface ModpackPreview {
-  token: string;
-  name: string;
-  summary: string | null;
-  version: string;
-  minecraft_version: string;
-  loader: Loader;
-  loader_version: string | null;
-  mod_count: number;
-  file_count: number;
-  download_bytes: number;
-  override_count: number;
-  external_files: number;
-  icon_url: string | null;
-}
-
-// ───── Catálogo comunitario ─────
-
-export interface CatalogFile {
-  file_name: string;
-  sha1: string;
-  size: number;
-}
-
-export interface CatalogEntry {
-  id: string;
-  kind: "pack" | "mod";
   name: string;
   description: string | null;
-  author: string;
-  owner: string;
-  created: string;
   minecraft_version: string;
   loader: Loader;
   loader_version: string | null;
-  code: string | null;
+  server_address: string | null;
+  memory: Memory | null;
   image_url: string | null;
-  mod_count: number | null;
-  file: CatalogFile | null;
+  active: boolean;
+  manifest: InstanceManifest | null;
+  updated: string | null;
+}
+
+export interface MyEvents {
+  uuid: string;
+  admin: boolean;
+  events: EventInfo[];
+}
+
+export interface Player {
+  uuid: string;
+  name: string;
+  added?: string;
+}
+
+export interface AdminEvent {
+  id: string;
+  name: string;
+  description: string | null;
+  server_address: string | null;
+  image_url: string | null;
+  pack_code: string | null;
+  minecraft_version: string;
+  loader: Loader;
+  loader_version: string | null;
+  memory: Memory | null;
+  active: boolean;
+  players: Player[];
+  updated: string | null;
+}
+
+export interface EventInput {
+  name: string;
+  description: string | null;
+  server_address: string | null;
+  image_url: string | null;
+  pack_code: string | null;
+  minecraft_version: string | null;
+  loader: Loader | null;
+  loader_version: string | null;
+  memory: Memory | null;
+  active: boolean;
 }

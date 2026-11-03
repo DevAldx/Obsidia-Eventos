@@ -99,6 +99,8 @@ pub struct LaunchInput<'a> {
     pub user_jvm_args: &'a [String],
     pub auth: &'a LaunchAuth,
     pub screen: Screen,
+    /// Servidor al que entrar directamente al abrir el juego (`host` o `host:puerto`).
+    pub server: Option<&'a str>,
 }
 
 /// Windows separa las entradas del classpath con `;`; el resto, con `:`.
@@ -143,8 +145,13 @@ pub fn build_command(input: &LaunchInput<'_>) -> Result<LaunchCommand> {
     if input.auth.demo {
         features.insert("is_demo_user");
     }
+    if input.server.is_some() {
+        // 1.20+ (23w14a): el juego entra al servidor con `--quickPlayMultiplayer`.
+        features.insert("is_quick_play_multiplayer");
+    }
 
     let vars: HashMap<&str, String> = HashMap::from([
+        ("quickPlayMultiplayer", input.server.unwrap_or_default().to_owned()),
         ("auth_player_name", input.auth.player_name.clone()),
         ("version_name", p.meta.id.clone()),
         ("game_directory", path_str(input.game_dir)),
@@ -214,6 +221,16 @@ pub fn build_command(input: &LaunchInput<'_>) -> Result<LaunchCommand> {
     }
     if input.screen.fullscreen {
         args.push("--fullscreen".into());
+    }
+    if let Some(server) = input.server {
+        // Versiones anteriores a quickPlay: `--server` y `--port`.
+        if !args.iter().any(|a| a == "--quickPlayMultiplayer") {
+            let (host, port) = match server.rsplit_once(':') {
+                Some((h, p)) if p.parse::<u16>().is_ok() => (h, p),
+                _ => (server, "25565"),
+            };
+            args.extend(["--server".into(), host.to_owned(), "--port".into(), port.to_owned()]);
+        }
     }
 
     let secrets = if input.auth.access_token.len() >= 8 {
@@ -353,7 +370,12 @@ mod tests {
     }
 
     fn build(p: &PreparedVersion, auth: &LaunchAuth, fullscreen: bool) -> Vec<String> {
+        build_with_server(p, auth, fullscreen, None)
+    }
+
+    fn build_with_server(p: &PreparedVersion, auth: &LaunchAuth, fullscreen: bool, server: Option<&str>) -> Vec<String> {
         let input = LaunchInput {
+            server,
             prepared: p,
             java: Path::new("/jvm/bin/java"),
             game_dir: Path::new("/inst/OBS-AAAAAA"),
@@ -368,6 +390,17 @@ mod tests {
 
     fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    #[test]
+    fn joins_the_event_server() {
+        let p = prepared(MODERN, None);
+        let args = build_with_server(&p, &LaunchAuth::demo(), false, Some("mc.example.com:25570"));
+        assert_eq!(value_after(&args, "--server"), Some("mc.example.com"));
+        assert_eq!(value_after(&args, "--port"), Some("25570"));
+        let args = build_with_server(&p, &LaunchAuth::demo(), false, Some("play.example.net"));
+        assert_eq!(value_after(&args, "--port"), Some("25565"));
+        assert!(!build(&p, &LaunchAuth::demo(), false).contains(&"--server".to_owned()));
     }
 
     #[test]

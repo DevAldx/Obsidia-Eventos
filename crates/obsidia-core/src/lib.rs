@@ -1,21 +1,19 @@
-//! Núcleo de Obsidia.
+//! Núcleo de Obsidia Eventos.
 //!
 //! Esta crate no depende de Tauri: toda la lógica es testeable por separado y
 //! `src-tauri` solo expone comandos IPC finos sobre estas APIs.
 
 pub mod auth;
 pub mod background;
-pub mod catalog;
 pub mod config;
 pub mod downloads;
+pub mod events;
 pub mod error;
 pub mod filesystem;
 pub mod instances;
 pub mod java;
 pub mod launcher;
 pub mod minecraft;
-pub mod modrinth;
-pub mod mods;
 pub mod news;
 pub mod paths;
 pub mod share;

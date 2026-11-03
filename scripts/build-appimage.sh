@@ -28,7 +28,7 @@ if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ] && [ -z "${TAURI_SIGNING_PRIVATE_KEY_
   exit 1
 fi
 
-echo "== Compilando Obsidia $VERSION =="
+echo "== Compilando Obsidia Eventos $VERSION =="
 npm run tauri build -- --bundles appimage
 
 # Tauri descarga linuxdeploy-plugin-appimage durante el build de arriba, así
@@ -41,7 +41,7 @@ if [ -z "$PLUGIN" ]; then
 fi
 
 BUNDLE_DIR="$BASE_DIR/src-tauri/target/release/bundle/appimage"
-APPDIR="$BUNDLE_DIR/Obsidia.AppDir"
+APPDIR=$(find "$BUNDLE_DIR" -maxdepth 1 -type d -name '*.AppDir' | head -1)
 APPIMAGE=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*.AppImage' -name "*${VERSION}*" | head -1)
 
 if [ ! -d "$APPDIR" ]; then
