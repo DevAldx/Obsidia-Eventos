@@ -141,7 +141,10 @@ export const ADMIN_HTML = `<!doctype html>
             <label class="field nopack">Loader
               <select name="loader"><option value="vanilla">Vanilla</option><option value="fabric">Fabric</option></select>
             </label>
-            <label class="field nopack fabric-only">Versión de Fabric Loader <input name="loader_version" class="mono" placeholder="0.16.5"></label>
+            <label class="field nopack fabric-only">Versión de Fabric Loader <span class="hint" id="fabric-hint"></span>
+              <input name="loader_version" class="mono" placeholder="0.16.5" list="fabric-versions">
+              <datalist id="fabric-versions"></datalist>
+            </label>
             <label class="field">Memoria máxima (MB) <input name="memory_max" type="number" min="1024" step="512" value="4096"></label>
             <label class="field wide">Imagen <span class="hint">(https, opcional)</span><input name="image_url" class="mono" placeholder="https://…/portada.jpg"></label>
             <label class="check wide"><input type="checkbox" name="active" checked> Abierto: los jugadores de la whitelist lo ven y pueden jugar</label>
@@ -270,7 +273,51 @@ function updateVisibility() {
   form.querySelector(".fabric-only").hidden = usesPack || form.loader.value !== "fabric";
 }
 form.pack_code.addEventListener("input", updateVisibility);
-form.loader.addEventListener("change", updateVisibility);
+form.loader.addEventListener("change", () => { updateVisibility(); fillFabric(); });
+
+// Versión de Fabric Loader automática: la última estable para esa versión de
+// Minecraft. Solo pisa el campo si está vacío o lo rellenó esto mismo.
+let fabricAuto = false;
+let fabricTimer = null;
+let fabricSeq = 0;
+form.loader_version.addEventListener("input", () => { fabricAuto = false; });
+form.minecraft_version.addEventListener("input", () => {
+  clearTimeout(fabricTimer);
+  fabricTimer = setTimeout(fillFabric, 500);
+});
+async function fillFabric() {
+  if (form.loader.value !== "fabric" || form.pack_code.value.trim() !== "") return;
+  const mc = form.minecraft_version.value.trim();
+  const hint = $("fabric-hint");
+  const list = $("fabric-versions");
+  if (!mc) return;
+  const seq = ++fabricSeq;
+  hint.textContent = "(buscando…)";
+  try {
+    const res = await fetch("https://meta.fabricmc.net/v2/versions/loader/" + encodeURIComponent(mc));
+    const data = res.ok ? await res.json() : [];
+    if (seq !== fabricSeq) return;
+    list.replaceChildren();
+    if (!Array.isArray(data) || data.length === 0) {
+      hint.textContent = "(Fabric no tiene la " + mc + ")";
+      return;
+    }
+    for (const x of data.slice(0, 20)) {
+      const o = document.createElement("option");
+      o.value = x.loader.version;
+      if (x.loader.stable) o.label = "estable";
+      list.appendChild(o);
+    }
+    const best = (data.find((x) => x.loader.stable) || data[0]).loader.version;
+    if (!form.loader_version.value.trim() || fabricAuto) {
+      form.loader_version.value = best;
+      fabricAuto = true;
+    }
+    hint.textContent = "(última estable para " + mc + ": " + best + ")";
+  } catch {
+    if (seq === fabricSeq) hint.textContent = "(no se pudo consultar Fabric; escríbela a mano)";
+  }
+}
 form.name.addEventListener("input", () => { $("event-title").textContent = form.name.value || "Sin nombre"; });
 
 function renderEditor() {
@@ -293,6 +340,9 @@ function renderEditor() {
   form.image_url.value = ev ? ev.image_url || "" : "";
   form.active.checked = ev ? ev.active : true;
   updateVisibility();
+  fabricAuto = false;
+  $("fabric-hint").textContent = "";
+  fillFabric();
   $("whitelist").hidden = !ev;
   $("filter").value = "";
   renderPlayers();

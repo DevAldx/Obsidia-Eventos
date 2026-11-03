@@ -730,7 +730,7 @@ async function adminRemovePlayer(request, env, id, rawUuid) {
 // ───────────────────────────── Panel web ─────────────────────────────
 
 const PAGE_CSP =
-  "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; " +
+  "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self' https://meta.fabricmc.net; img-src 'self' data:; " +
   "form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 function page(body, type) {
