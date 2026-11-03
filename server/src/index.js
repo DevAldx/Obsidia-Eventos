@@ -1,3 +1,5 @@
+import { ADMIN_HTML, ADMIN_JS } from "./admin-page.js";
+
 // Servidor de Obsidia Eventos (Cloudflare Worker + KV/R2).
 //
 // Es un cliente privado: solo entra quien está en la whitelist de algún
@@ -21,6 +23,11 @@
 //   DELETE /api/admin/events/<id>/players/<uuid>  quitar de la whitelist
 //   PUT    /api/files/<sha1>, POST /api/packs     subir el pack del evento (desde Obsidia normal)
 //   DELETE /api/packs/<code>
+//
+// Panel web (contraseña ADMIN_PASSWORD):
+//   GET  /admin                                  la página del panel
+//   POST /api/admin/web-login    { password }    -> { token } sesión web de admin (12 h)
+//   GET  /api/admin/resolve?q=<nombre|uuid>      -> { uuid, name } (admin)
 //
 // Servidor de Minecraft (clave SERVER_KEY):
 //   GET  /api/server/<EVT-XXXXXX>/whitelist.json  la whitelist en el formato de Minecraft
@@ -61,6 +68,9 @@ const MC_VERSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const LOADER_VERSION_RE = /^[A-Za-z0-9._-]{1,32}$/;
 // host o host:puerto (sin esquema).
 const SERVER_ADDRESS_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$/;
+
+const WEB_TOKEN_TTL_S = 12 * 60 * 60;
+const WEB_ADMIN = "web";
 
 const enc = new TextEncoder();
 
@@ -148,6 +158,11 @@ async function route(request, env) {
   if (path === "/" && method === "GET") {
     return json({ service: "obsidia-eventos", version: 1 });
   }
+
+  if ((path === "/admin" || path === "/admin/") && method === "GET") return page(ADMIN_HTML, "text/html");
+  if (path === "/admin/app.js" && method === "GET") return page(ADMIN_JS, "text/javascript");
+  if (path === "/api/admin/web-login" && method === "POST") return webLogin(request, env);
+  if (path === "/api/admin/resolve" && method === "GET") return adminResolve(request, env, url);
 
   let m = path.match(/^\/files\/([0-9a-f]{40})$/);
   if (m && (method === "GET" || method === "HEAD")) {
@@ -467,6 +482,11 @@ function isAdmin(env, uuid) {
 }
 
 async function requireAdmin(request, env) {
+  const auth = request.headers.get("authorization") ?? "";
+  if (auth.startsWith(`Bearer ${WEB_ADMIN}.`)) {
+    await verify(env, "webadmin", auth.slice(7), 1);
+    return WEB_ADMIN;
+  }
   const uuid = await requireUser(request, env);
   if (!isAdmin(env, uuid)) throw new HttpError(403, "solo los administradores del evento pueden hacer esto");
   return uuid;
@@ -705,6 +725,75 @@ async function adminRemovePlayer(request, env, id, rawUuid) {
   event.updated = new Date().toISOString();
   await writeEvents(env, events);
   return json({ players: event.players });
+}
+
+// ───────────────────────────── Panel web ─────────────────────────────
+
+const PAGE_CSP =
+  "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; " +
+  "form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+
+function page(body, type) {
+  return new Response(body, {
+    headers: {
+      "content-type": `${type}; charset=utf-8`,
+      "content-security-policy": PAGE_CSP,
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+async function webLogin(request, env) {
+  const expected = String(env.ADMIN_PASSWORD ?? "");
+  if (expected.length < 12) {
+    throw new HttpError(503, "falta configurar ADMIN_PASSWORD (wrangler secret put ADMIN_PASSWORD, 12+ caracteres)");
+  }
+  const body = await request.json().catch(() => null);
+  const given = String(body?.password ?? "");
+  // Compara los HMAC (misma longitud siempre) para no filtrar nada por tiempos.
+  if (!safeEqual(await hmac(env, `pw:${given}`), await hmac(env, `pw:${expected}`))) {
+    throw new HttpError(401, "contraseña incorrecta");
+  }
+  return json({ token: await sign(env, "webadmin", [WEB_ADMIN], WEB_TOKEN_TTL_S) }, 200, { "cache-control": "no-store" });
+}
+
+/** Nombre o UUID → { uuid, name }. Mojang suele bloquear a Cloudflare, así que hay respaldo. */
+async function adminResolve(request, env, url) {
+  await requireAdmin(request, env);
+  const q = String(url.searchParams.get("q") ?? "").trim();
+  const uuidQuery = q.replace(/-/g, "").toLowerCase();
+  const isUuid = UUID_RE.test(uuidQuery);
+  if (!isUuid && !MC_NAME_RE.test(q)) throw new HttpError(400, "no es un nombre de Minecraft ni un UUID");
+
+  const sources = isUuid
+    ? [
+        [`https://sessionserver.mojang.com/session/minecraft/profile/${uuidQuery}`, (d) => d],
+        [`https://playerdb.co/api/player/minecraft/${uuidQuery}`, (d) => d?.data?.player && { id: d.data.player.raw_id, name: d.data.player.username }],
+      ]
+    : [
+        [`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(q)}`, (d) => d],
+        [`https://playerdb.co/api/player/minecraft/${encodeURIComponent(q)}`, (d) => d?.data?.player && { id: d.data.player.raw_id, name: d.data.player.username }],
+      ];
+  let notFound = false;
+  for (const [src, pick] of sources) {
+    try {
+      const res = await fetch(src, { headers: { accept: "application/json", "user-agent": "obsidia-eventos" } });
+      if (res.status === 204 || res.status === 404 || (res.status === 400 && src.includes("playerdb"))) {
+        notFound = true;
+        continue;
+      }
+      if (!res.ok) continue;
+      const p = pick(await res.json());
+      const uuid = String(p?.id ?? "").replace(/-/g, "").toLowerCase();
+      if (UUID_RE.test(uuid) && MC_NAME_RE.test(String(p?.name ?? ""))) return json({ uuid, name: p.name });
+    } catch {
+      // probar la siguiente fuente
+    }
+  }
+  if (notFound) throw new HttpError(404, "no existe esa cuenta de Minecraft");
+  throw new HttpError(502, "no se pudo consultar a Mojang ahora mismo; prueba otra vez");
 }
 
 // ───────────────────────────── Servidor de Minecraft ─────────────────────────────

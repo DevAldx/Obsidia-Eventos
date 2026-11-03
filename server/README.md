@@ -31,6 +31,20 @@ es la que trae el launcher por defecto. Si sale otra, cámbiala en
 antes de compilar, o pídele a cada jugador que la ponga en **Ajustes →
 Servidor de eventos**.
 
+## Panel web
+
+Además del panel Admin del launcher, hay uno en el navegador:
+`https://obsidia-eventos.<cuenta>.workers.dev/admin`. Se entra con una
+contraseña que se guarda como secreto:
+
+```bash
+npx wrangler secret put ADMIN_PASSWORD    # 12 caracteres o más
+```
+
+Desde ahí se crean y editan eventos y se gestiona la whitelist (por nombre o
+UUID; el Worker busca la cuenta en Mojang y, si Cloudflare está bloqueado,
+en playerdb.co). La sesión web dura 12 horas y solo vale para administrar.
+
 ## Rutas
 
 | Ruta | Quién | Para qué |
@@ -45,6 +59,9 @@ Servidor de eventos**.
 | `DELETE /api/admin/events/<EVT-…>/players/<uuid>` | admin | quitar de la whitelist |
 | `PUT /api/files/<sha1>`, `POST /api/packs`, `DELETE /api/packs/<código>` | admin | subir y borrar packs (desde Obsidia normal) |
 | `GET /files/<sha1>` | cualquiera con el hash | un archivo de un pack |
+| `GET /admin` | navegador | panel web de administración |
+| `POST /api/admin/web-login` | navegador | `{ password }` → sesión web de admin |
+| `GET /api/admin/resolve?q=<nombre o uuid>` | admin | busca la cuenta de Minecraft |
 | `GET /api/server/<EVT-…>/whitelist.json` | servidor de Minecraft (`SERVER_KEY`) | la whitelist en el formato de Minecraft |
 
 - **Identidad:** el launcher firma un desafío con la clave del certificado de

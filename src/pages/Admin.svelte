@@ -5,6 +5,7 @@
   import { toasts } from "../lib/toast.svelte";
   import type { AdminEvent, EventInput, Loader, Player } from "../lib/types";
   import Icon from "../components/Icon.svelte";
+  import Modal from "../components/Modal.svelte";
 
   let list = $state<AdminEvent[]>([]);
   let loading = $state(false);
@@ -30,6 +31,17 @@
   let playerQuery = $state("");
   let adding = $state(false);
   let filter = $state("");
+  /** Ventana de whitelist: abierta o no, y de qué evento. */
+  let wlOpen = $state(false);
+  let wlId = $state<string | null>(null);
+  const wlEvent = $derived(list.find((e) => e.id === wlId) ?? null);
+
+  function openWhitelist(id: string | null = null) {
+    wlId = id ?? (current ? current.id : (list[0]?.id ?? null));
+    playerQuery = "";
+    filter = "";
+    wlOpen = true;
+  }
 
   function emptyDraft(): Draft {
     return {
@@ -79,8 +91,6 @@
     openId = id;
     const e = list.find((x) => x.id === id);
     draft = e ? toDraft(e) : emptyDraft();
-    playerQuery = "";
-    filter = "";
   }
 
   const usesPack = $derived(draft.pack_code.trim() !== "");
@@ -136,7 +146,8 @@
 
   /** Acepta varios nombres o UUIDs separados por comas, espacios o saltos de línea. */
   async function addPlayers() {
-    if (!current) return;
+    const ev = wlEvent;
+    if (!ev) return;
     const queries = playerQuery.split(/[\s,;]+/).map((q) => q.trim()).filter(Boolean);
     if (queries.length === 0) return;
     adding = true;
@@ -151,7 +162,7 @@
     }
     try {
       if (found.length > 0) {
-        current.players = await api.adminPlayersAdd(current.id, found);
+        ev.players = await api.adminPlayersAdd(ev.id, found);
         toasts.success(`${found.length} jugador(es) añadidos a la whitelist`);
       }
       playerQuery = failed.length > 0 ? queries.filter((q) => failed.some((f) => f.startsWith(`${q}:`))).join("\n") : "";
@@ -164,16 +175,17 @@
   }
 
   async function removePlayer(p: Player) {
-    if (!current) return;
+    const ev = wlEvent;
+    if (!ev) return;
     try {
-      current.players = await api.adminPlayerRemove(current.id, p.uuid);
+      ev.players = await api.adminPlayerRemove(ev.id, p.uuid);
     } catch (e) {
       toasts.error(e, "No se pudo quitar");
     }
   }
 
   const shownPlayers = $derived(
-    (current?.players ?? []).filter(
+    (wlEvent?.players ?? []).filter(
       (p) => !filter || p.name.toLowerCase().includes(filter.toLowerCase()) || p.uuid.includes(filter.toLowerCase()),
     ),
   );
@@ -194,7 +206,10 @@
   <aside class="list">
     <div class="list-head">
       <p class="eyebrow">Eventos</p>
-      <button class="btn sm primary" onclick={() => open("new")}><Icon name="plus" size={14} /> Nuevo</button>
+      <div class="head-actions">
+        <button class="btn sm" onclick={() => openWhitelist()}><Icon name="user" size={14} /> Whitelist</button>
+        <button class="btn sm primary" onclick={() => open("new")}><Icon name="plus" size={14} /> Nuevo</button>
+      </div>
     </div>
     {#if loading && list.length === 0}
       <div class="skeleton item-skel"></div>
@@ -235,7 +250,12 @@
             <h2 class="display">{draft.name || "Sin nombre"}</h2>
           </div>
           {#if current}
-            <button class="btn danger-soft sm" onclick={remove}><Icon name="trash" size={14} /> Borrar</button>
+            <div class="head-actions">
+              <button class="btn sm primary" onclick={() => openWhitelist(current.id)}>
+                <Icon name="user" size={14} /> Whitelist ({current.players.length})
+              </button>
+              <button class="btn danger-soft sm" onclick={remove}><Icon name="trash" size={14} /> Borrar</button>
+            </div>
           {/if}
         </div>
 
@@ -302,59 +322,79 @@
         </div>
 
         {#if current}
-          <div class="whitelist">
-            <div class="wl-head">
-              <div>
-                <p class="eyebrow">Whitelist</p>
-                <h3 class="display">{current.players.length} jugadores con acceso</h3>
-              </div>
-              <button class="btn ghost sm" onclick={() => copy(current.players.map((p) => p.name).join("\n"))} disabled={current.players.length === 0}>
-                <Icon name="layers" size={14} /> Copiar nombres
-              </button>
-            </div>
-            <div class="add">
-              <textarea
-                bind:value={playerQuery}
-                rows="2"
-                placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"
-                onkeydown={(e) => e.key === "Enter" && (e.ctrlKey || e.metaKey) && addPlayers()}
-              ></textarea>
-              <button class="btn primary" onclick={addPlayers} disabled={adding || !playerQuery.trim()}>
-                <Icon name="plus" size={15} /> {adding ? "Buscando…" : "Añadir"}
-              </button>
-            </div>
-            {#if current.players.length > 8}
-              <input class="filter" bind:value={filter} placeholder="Buscar en la whitelist…" />
-            {/if}
-            <ul class="players">
-              {#each shownPlayers as p (p.uuid)}
-                <li>
-                  <span class="p-name">{p.name}</span>
-                  <span class="p-uuid mono">{p.uuid}</span>
-                  <button class="icon-btn" title="Quitar de la whitelist" onclick={() => removePlayer(p)}><Icon name="close" size={14} /></button>
-                </li>
-              {:else}
-                <li class="hint">Nadie todavía. Añade a los participantes arriba.</li>
-              {/each}
-            </ul>
-            <details class="advanced">
-              <summary>Proteger también el servidor de Minecraft</summary>
-              <p class="hint">
-                El launcher solo enseña el evento a quien está en la lista, pero cualquiera que conozca la IP
-                podría entrar con otro launcher. Activa <span class="mono">white-list=true</span> y
-                <span class="mono">enforce-whitelist=true</span> en el servidor y sincroniza esta lista con:
-              </p>
-              <pre class="mono">curl -fsS -H "Authorization: Bearer $SERVER_KEY" \
-  {serverUrl}/api/server/{current.id}/whitelist.json \
-  -o whitelist.json && rcon-cli whitelist reload</pre>
-              <button class="btn sm" onclick={() => copy(current.id)}>Copiar ID del evento</button>
-            </details>
-          </div>
+          <p class="hint">Para decidir quién entra, pulsa <strong>Whitelist</strong> arriba.</p>
+        {:else}
+          <p class="hint">Crea el evento y luego añade a los jugadores con el botón <strong>Whitelist</strong>.</p>
         {/if}
       </div>
     {/if}
   </section>
 </div>
+
+{#if wlOpen}
+  <Modal title="Whitelist" subtitle="Solo estas cuentas ven el evento y pueden jugarlo" width={620} busy={adding} onclose={() => (wlOpen = false)}>
+    {#if list.length === 0}
+      <p class="hint">Todavía no hay eventos. Crea uno primero: la whitelist es de cada evento.</p>
+    {:else}
+      <div class="whitelist">
+        <label class="field">
+          <span>Evento</span>
+          <select bind:value={wlId} onchange={() => (filter = "")}>
+            {#each list as e (e.id)}
+              <option value={e.id}>{e.name}{e.active ? "" : " (cerrado)"}</option>
+            {/each}
+          </select>
+        </label>
+        {#if wlEvent}
+          <div class="wl-head">
+            <h3 class="display">{wlEvent.players.length} jugadores con acceso</h3>
+            <button class="btn ghost sm" onclick={() => copy(wlEvent.players.map((p) => p.name).join("\n"))} disabled={wlEvent.players.length === 0}>
+              <Icon name="layers" size={14} /> Copiar nombres
+            </button>
+          </div>
+          <div class="add">
+            <textarea
+              bind:value={playerQuery}
+              rows="2"
+              placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"
+              onkeydown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), addPlayers())}
+            ></textarea>
+            <button class="btn primary" onclick={addPlayers} disabled={adding || !playerQuery.trim()}>
+              <Icon name="plus" size={15} /> {adding ? "Buscando…" : "Añadir"}
+            </button>
+          </div>
+          <p class="hint">Enter para añadir · Shift+Enter para otra línea.</p>
+          {#if wlEvent.players.length > 8}
+            <input class="filter" bind:value={filter} placeholder="Buscar en la whitelist…" />
+          {/if}
+          <ul class="players">
+            {#each shownPlayers as p (p.uuid)}
+              <li>
+                <span class="p-name">{p.name}</span>
+                <span class="p-uuid mono">{p.uuid}</span>
+                <button class="icon-btn" title="Quitar de la whitelist" onclick={() => removePlayer(p)}><Icon name="close" size={14} /></button>
+              </li>
+            {:else}
+              <li class="hint">Nadie todavía. Añade a los participantes arriba.</li>
+            {/each}
+          </ul>
+          <details class="advanced">
+            <summary>Proteger también el servidor de Minecraft</summary>
+            <p class="hint">
+              El launcher solo enseña el evento a quien está en la lista, pero cualquiera que conozca la IP
+              podría entrar con otro launcher. Activa <span class="mono">white-list=true</span> y
+              <span class="mono">enforce-whitelist=true</span> en el servidor y sincroniza esta lista con:
+            </p>
+            <pre class="mono">curl -fsS -H "Authorization: Bearer $SERVER_KEY" \
+  {serverUrl}/api/server/{wlEvent.id}/whitelist.json \
+  -o whitelist.json && rcon-cli whitelist reload</pre>
+            <button class="btn sm" onclick={() => copy(wlEvent.id)}>Copiar ID del evento</button>
+          </details>
+        {/if}
+      </div>
+    {/if}
+  </Modal>
+{/if}
 
 <style>
   .admin {
@@ -467,8 +507,10 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding-top: 18px;
-    border-top: 1px solid var(--border);
+  }
+  .head-actions {
+    display: flex;
+    gap: 8px;
   }
   .add {
     display: flex;

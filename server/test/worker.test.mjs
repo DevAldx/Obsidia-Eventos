@@ -330,3 +330,65 @@ test("valida los datos del evento", async () => {
   });
   assert.equal(badPlayers.status, 400);
 });
+
+test("panel web: contraseña, token propio y búsqueda de jugadores", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+
+  const html = await call(env, "GET", "/admin");
+  assert.equal(html.status, 200);
+  assert.match(html.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  assert.match(await html.text(), /\/admin\/app\.js/);
+  assert.equal((await call(env, "GET", "/admin/app.js")).status, 200);
+
+  const login = (password) =>
+    call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password }), headers: { "content-type": "application/json" } });
+  assert.equal((await login("mala")).status, 401);
+  assert.equal((await login("")).status, 401);
+  const { token } = await (await login("contraseña-larga-de-prueba")).json();
+  assert.match(token, /^web\./);
+
+  // Sirve para administrar, pero no como sesión de jugador.
+  assert.equal((await call(env, "GET", "/api/admin/events", { token })).status, 200);
+  assert.equal((await call(env, "GET", "/api/events", { token })).status, 401);
+  // Un token web manipulado no vale.
+  assert.equal((await call(env, "GET", "/api/admin/events", { token: token.slice(0, -2) + "xx" })).status, 401);
+  // Un token de jugador (aunque sea admin) no se acepta disfrazado de token web.
+  const playerToken = await tokenOf(env, PLAYER);
+  assert.equal((await call(env, "GET", "/api/admin/events", { token: `web.${playerToken}` })).status, 401);
+
+  const created = await post(env, "/api/admin/events", token, { name: "Desde la web", minecraft_version: "1.21.1" });
+  assert.equal(created.status, 201, await created.clone().text());
+  const ev = await created.json();
+  assert.equal(ev.created_by, "web");
+
+  // Mojang bloqueado (403) → respaldo playerdb.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    u = String(u);
+    if (u.includes("mojang.com")) return new Response("blocked", { status: 403 });
+    if (u.endsWith("/Steve")) {
+      return Response.json({ data: { player: { raw_id: PLAYER, username: "Steve" } } });
+    }
+    return new Response("{}", { status: 400 });
+  };
+  try {
+    const found = await call(env, "GET", "/api/admin/resolve?q=Steve", { token });
+    assert.deepEqual(await found.json(), { uuid: PLAYER, name: "Steve" });
+    assert.equal((await call(env, "GET", "/api/admin/resolve?q=NoExiste", { token })).status, 404);
+    assert.equal((await call(env, "GET", "/api/admin/resolve?q=mal%20nombre", { token })).status, 400);
+    assert.equal((await call(env, "GET", "/api/admin/resolve?q=Steve", { token: playerToken })).status, 403);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  const added = await post(env, `/api/admin/events/${ev.id}/players`, token, { players: [{ uuid: PLAYER, name: "Steve" }] });
+  assert.equal(added.status, 200);
+  const mine = await (await call(env, "GET", "/api/events", { token: playerToken })).json();
+  assert.deepEqual(mine.events.map((e) => e.id), [ev.id]);
+});
+
+test("panel web: sin ADMIN_PASSWORD no se puede entrar", async () => {
+  const env = makeEnv();
+  const res = await call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: "" }) });
+  assert.equal(res.status, 503);
+});
