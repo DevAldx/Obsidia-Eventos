@@ -795,6 +795,9 @@ async function listMyEvents(request, env) {
       rank,
       admin: team,
       permissions: permissionsOf(rank),
+      // ¿Hay algún evento abierto? Sin eventos, el launcher dice «No hay eventos
+      // disponibles» en vez de «No estás en ninguna whitelist». No dice cuáles.
+      any_events: events.items.some((e) => e.active !== false),
       events: await Promise.all(mine.map((e) => playerView(env, e))),
     },
     200,

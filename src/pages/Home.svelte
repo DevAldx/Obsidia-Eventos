@@ -93,6 +93,27 @@
         <button class="btn primary" onclick={() => app.loadEvents()}><Icon name="refresh" size={15} /> Reintentar</button>
       </div>
     </section>
+  {:else if events.length === 0 && (app.me?.any_events === false || app.me?.admin)}
+    <!-- ───────────── No hay ningún evento abierto ───────────── -->
+    <section class="gate obsidia-bg">
+      <div class="gate-card">
+        <span class="lock"><Icon name="star" size={26} /></span>
+        <p class="eyebrow">Sin eventos</p>
+        <h1 class="display">No hay ningún evento disponible</h1>
+        <p class="hint">
+          Ahora mismo no hay eventos abiertos. Cuando el organizador publique uno, aparecerá aquí; pulsa
+          «Comprobar de nuevo» para verlo.
+        </p>
+        <div class="row">
+          <button class="btn primary" onclick={() => app.loadEvents()} disabled={app.eventsLoading}>
+            <Icon name="refresh" size={15} /> {app.eventsLoading ? "Comprobando…" : "Comprobar de nuevo"}
+          </button>
+          {#if app.me?.permissions.manage_events}
+            <button class="btn" onclick={() => nav.go("admin")}><Icon name="settings" size={15} /> Crear un evento</button>
+          {/if}
+        </div>
+      </div>
+    </section>
   {:else if events.length === 0}
     <!-- ───────────── Fuera de la whitelist ───────────── -->
     <section class="gate obsidia-bg">

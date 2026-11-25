@@ -271,6 +271,8 @@ export interface MyEvents {
   admin: boolean;
   rank: Rank | null;
   permissions: Permissions;
+  /** ¿Hay algún evento abierto? `null` con un servidor antiguo. */
+  any_events: boolean | null;
   events: EventInfo[];
 }
 

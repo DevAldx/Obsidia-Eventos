@@ -502,6 +502,8 @@ test("rangos: cada uno solo puede lo suyo", async () => {
   const meGuest = await (await call(env, "GET", "/api/events", { token: guest })).json();
   assert.equal(meGuest.rank, "invitado");
   assert.equal(meGuest.admin, false);
+  // Sin eventos: el launcher dice «No hay eventos» en vez de «no estás en la whitelist».
+  assert.equal(meGuest.any_events, false);
 
   // El owner reparte rangos.
   assert.equal((await setRank(owner, DEV, "Dev_1", "developer")).status, 200);
@@ -537,7 +539,14 @@ test("rangos: cada uno solo puede lo suyo", async () => {
   // El equipo ve todos los eventos (aunque estén cerrados y no esté en la whitelist).
   const staffEvents = await (await call(env, "GET", "/api/events", { token: staff })).json();
   assert.deepEqual(staffEvents.events.map((e) => e.id), [ev.id]);
-  assert.equal((await (await call(env, "GET", "/api/events", { token: guest })).json()).events.length, 0);
+  const guestView = await (await call(env, "GET", "/api/events", { token: guest })).json();
+  assert.equal(guestView.events.length, 0);
+  assert.equal(guestView.any_events, false, "el único evento está cerrado: no cuenta");
+  // Con un evento abierto en el que no está, sí es «no estás en la whitelist».
+  const open = await (await post(env, "/api/admin/events", dev, { name: "Abierto", minecraft_version: "1.21.1" })).json();
+  const guestView2 = await (await call(env, "GET", "/api/events", { token: guest })).json();
+  assert.deepEqual([guestView2.events.length, guestView2.any_events], [0, true]);
+  assert.equal((await call(env, "DELETE", `/api/admin/events/${open.id}`, { token: dev })).status, 204);
 
   // Staff añade a la whitelist y da Miembro, pero no Staff ni superior.
   const players = `/api/admin/events/${ev.id}/players`;

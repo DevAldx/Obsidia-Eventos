@@ -98,6 +98,9 @@ pub struct MyEvents {
     pub rank: Option<String>,
     #[serde(default)]
     pub permissions: Permissions,
+    /// ¿Hay algún evento abierto en el servidor? (None = servidor antiguo, no lo dice)
+    #[serde(default)]
+    pub any_events: Option<bool>,
     pub events: Vec<EventInfo>,
 }
 
