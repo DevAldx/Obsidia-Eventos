@@ -560,11 +560,15 @@ async function readMembers(env) {
 
 const writeMembers = (env, members) => env.BUCKET.put(MEMBERS_KEY, JSON.stringify(members));
 
-/** Rango de una cuenta: owner fijo (ADMIN_UUIDS), el de la lista de miembros o invitado. */
+/**
+ * Rango de una cuenta: el de la lista de miembros; si no tiene, Owner para
+ * ADMIN_UUIDS e Invitado para el resto. El panel web puede cambiar también a
+ * las cuentas de ADMIN_UUIDS: su rango guardado manda sobre el de wrangler.toml.
+ */
 function rankIn(env, members, uuid) {
-  if (isAdmin(env, uuid)) return "owner";
   const rank = members.items.find((m) => m.uuid === uuid)?.rank;
-  return RANKS.includes(rank) ? rank : "invitado";
+  if (RANKS.includes(rank)) return rank;
+  return isAdmin(env, uuid) ? "owner" : "invitado";
 }
 
 /** Quién hace la petición y con qué rango. El panel web (contraseña) es owner. */
@@ -615,8 +619,10 @@ function checkCanActOn(env, actor, uuid) {
 
 function checkRankChange(env, actor, uuid, rank) {
   if (!RANKS.includes(rank)) throw new HttpError(400, `rango inválido: ${rank}`);
+  // El panel web (contraseña) puede cambiar el rango de cualquiera, también ADMIN_UUIDS.
+  if (actor.id === WEB_ADMIN) return;
   if (isAdmin(env, uuid)) {
-    throw new HttpError(403, "esa cuenta es Owner fijo (ADMIN_UUIDS en wrangler.toml); su rango no se cambia aquí");
+    throw new HttpError(403, "esa cuenta está en ADMIN_UUIDS: su rango solo se cambia desde el panel web");
   }
   checkCanActOn(env, actor, uuid);
   if (!assignableBy(actor).includes(rank)) {
@@ -624,11 +630,15 @@ function checkRankChange(env, actor, uuid, rank) {
   }
 }
 
-/** Aplica un rango ya comprobado. Invitado es el rango por defecto: no se guarda. */
-function applyRank(members, uuid, name, rank, by) {
+/**
+ * Aplica un rango ya comprobado. Invitado es el rango por defecto y no se
+ * guarda, salvo para ADMIN_UUIDS (si no, volverían a ser Owner).
+ */
+function applyRank(env, members, uuid, name, rank, by) {
+  const old = members.items.find((m) => m.uuid === uuid);
   members.items = members.items.filter((m) => m.uuid !== uuid);
-  if (rank !== "invitado") {
-    members.items.push({ uuid, name, rank, updated: new Date().toISOString(), updated_by: by });
+  if (rank !== "invitado" || isAdmin(env, uuid)) {
+    members.items.push({ uuid, name: name ?? old?.name ?? null, rank, updated: new Date().toISOString(), updated_by: by });
   }
   if (members.items.length > MAX_MEMBERS) throw new HttpError(507, `no se pueden tener más de ${MAX_MEMBERS} miembros con rango`);
 }
@@ -657,7 +667,7 @@ function fixedOwners(env) {
 async function adminListMembers(request, env) {
   const actor = await requireRank(request, env, "staff");
   const events = await readEvents(env);
-  const fixed = fixedOwners(env).map((uuid) => ({ uuid, name: knownName(actor.members, events, uuid), rank: "owner", fixed: true }));
+  const fixed = fixedOwners(env).map((uuid) => ({ uuid, name: knownName(actor.members, events, uuid), rank: rankIn(env, actor.members, uuid), fixed: true }));
   const members = actor.members.items.filter((m) => !isAdmin(env, m.uuid) && RANKS.includes(m.rank));
   members.sort((a, b) => level(b.rank) - level(a.rank) || a.name.localeCompare(b.name));
   return json(
@@ -672,11 +682,16 @@ async function adminSetMember(request, env, rawUuid) {
   const uuid = rawUuid.replace(/-/g, "").toLowerCase();
   if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
   const body = await request.json().catch(() => null);
-  const name = String(body?.name ?? "");
-  if (!MC_NAME_RE.test(name)) throw new HttpError(400, `nombre inválido: ${name}`);
+  // El nombre es opcional si la cuenta ya es conocida (p. ej. ADMIN_UUIDS sin nombre todavía).
+  let name = body?.name == null || body.name === "" ? null : String(body.name);
+  if (name !== null && !MC_NAME_RE.test(name)) throw new HttpError(400, `nombre inválido: ${name}`);
+  if (name === null) {
+    name = knownName(actor.members, await readEvents(env), uuid);
+    if (name === null && !isAdmin(env, uuid)) throw new HttpError(400, "falta el nombre de Minecraft de la cuenta");
+  }
   const rank = String(body?.rank ?? "");
   checkRankChange(env, actor, uuid, rank);
-  applyRank(actor.members, uuid, name, rank, actor.id);
+  applyRank(env, actor.members, uuid, name, rank, actor.id);
   await writeMembers(env, actor.members);
   return json({ uuid, name, rank });
 }
@@ -686,7 +701,7 @@ async function adminRemoveMember(request, env, rawUuid) {
   const uuid = rawUuid.replace(/-/g, "").toLowerCase();
   if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
   checkRankChange(env, actor, uuid, "invitado");
-  applyRank(actor.members, uuid, null, "invitado", actor.id);
+  applyRank(env, actor.members, uuid, null, "invitado", actor.id);
   await writeMembers(env, actor.members);
   return new Response(null, { status: 204 });
 }
@@ -938,7 +953,7 @@ async function adminAddPlayers(request, env, id) {
     if (existing) existing.name = name;
     else event.players.push({ uuid, name, added: new Date().toISOString(), added_by: actor.id });
     if (rank !== null && rank !== rankIn(env, actor.members, uuid)) {
-      applyRank(actor.members, uuid, name, rank, actor.id);
+      applyRank(env, actor.members, uuid, name, rank, actor.id);
       ranksChanged = true;
     }
   }
@@ -1171,8 +1186,9 @@ async function serverWhitelist(request, env, url, id) {
   const members = await readMembers(env);
   const byUuid = new Map();
   for (const p of event.players ?? []) byUuid.set(p.uuid, p.name);
-  for (const m of members.items) if (level(m.rank) >= level("staff")) byUuid.set(m.uuid, m.name);
-  for (const uuid of fixedOwners(env)) {
+  const team = new Set([...members.items.map((m) => m.uuid), ...fixedOwners(env)]);
+  for (const uuid of team) {
+    if (level(rankIn(env, members, uuid)) < level("staff")) continue;
     const name = knownName(members, events, uuid);
     if (name) byUuid.set(uuid, name);
   }

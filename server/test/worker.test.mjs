@@ -598,6 +598,29 @@ test("rangos: cada uno solo puede lo suyo", async () => {
   const wl = await (await call(env, "GET", `/api/server/${ev.id}/whitelist.json`, { token: SERVER_KEY })).json();
   const names = wl.map((p) => p.name).sort();
   assert.deepEqual(names, ["Dev_1", "Invitado_1", "Miembro_1", "Staff_1"]);
+
+  // Desde el panel web se puede cambiar a cualquiera, también a ADMIN_UUIDS.
+  const rankOf = async (uuid) => (await (await call(env, "GET", "/api/events", { token: await tokenOf(env, uuid) })).json()).rank;
+  // Aunque todavía no se conozca su nombre de Minecraft.
+  assert.equal((await setRank(web, UUID, "", "developer")).status, 200);
+  assert.equal(await rankOf(UUID), "developer");
+  // Para el resto de cuentas el nombre sigue siendo obligatorio.
+  assert.equal((await setRank(web, "e".repeat(32), "", "miembro")).status, 400);
+  assert.equal((await setRank(web, UUID, "Fundador", "staff")).status, 200);
+  assert.equal(await rankOf(UUID), "staff");
+  const fixedRow = (await (await call(env, "GET", "/api/admin/members", { token: web })).json()).members.find((m) => m.uuid === UUID);
+  assert.deepEqual([fixedRow.rank, fixedRow.fixed, fixedRow.name], ["staff", true, "Fundador"]);
+  // Al quitarle el rango se queda en Invitado (no vuelve a Owner por estar en ADMIN_UUIDS).
+  assert.equal((await call(env, "DELETE", `/api/admin/members/${UUID}`, { token: web })).status, 204);
+  assert.equal(await rankOf(UUID), "invitado");
+  assert.equal((await call(env, "GET", "/api/admin/members", { token: await tokenOf(env, UUID) })).status, 403);
+  // Un owner del launcher sigue sin poder tocar ADMIN_UUIDS; el panel web lo devuelve a Owner.
+  assert.equal((await setRank(newOwner, UUID, "Fundador", "owner")).status, 403);
+  assert.equal((await setRank(web, UUID, "Fundador", "owner")).status, 200);
+  assert.equal(await rankOf(UUID), "owner");
+  // El panel web también puede bajar a cualquier Owner.
+  assert.equal((await setRank(web, GUEST, "Invitado_1", "miembro")).status, 200);
+  assert.equal(await rankOf(GUEST), "miembro");
 });
 
 test("panel web: sin ADMIN_PASSWORD no se puede entrar", async () => {

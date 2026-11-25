@@ -163,7 +163,7 @@ export const ADMIN_HTML = `<!doctype html>
           <div><p class="eyebrow">Equipo</p><h2>Rangos</h2></div>
         </div>
         <div class="legend">
-          <span class="rank owner">Owner</span><span>Todo, incluido dar cualquier rango.</span>
+          <span class="rank owner">Owner</span><span>Todo, incluido dar cualquier rango. Desde este panel puedes cambiar el rango de cualquiera.</span>
           <span class="rank developer">Developer</span><span>Crear y editar eventos y mods, whitelist, dar rangos hasta Staff.</span>
           <span class="rank staff">Staff</span><span>Whitelist y dar Miembro o Invitado. Entra a todos los eventos.</span>
           <span class="rank miembro">Miembro</span><span>Juega los eventos en cuya whitelist está.</span>
@@ -267,8 +267,9 @@ function rankBadge(rank) {
   return s;
 }
 
-/** ¿Puedo cambiar el rango de esta cuenta? (los owners fijos no se tocan) */
+/** ¿Puedo cambiar el rango de esta cuenta? Desde el panel web (contraseña), a cualquiera. */
 function canChange(p) {
+  if (me.id === "web") return true;
   if (p.fixed || members.some((m) => m.fixed && m.uuid === p.uuid)) return false;
   return me.rank === "owner" || level(p.rank) < level(me.rank);
 }
@@ -291,7 +292,7 @@ function rankControl(p) {
     sel.disabled = true;
     try {
       await setRank(p.uuid, p.name, sel.value);
-      toast(p.name + " ahora es " + RANK_NAMES[sel.value], "ok");
+      toast((p.name || "La cuenta") + " ahora es " + RANK_NAMES[sel.value], "ok");
     } catch (err) {
       toast(err.message, "err");
       sel.value = p.rank || "invitado";
@@ -304,7 +305,7 @@ function rankControl(p) {
 
 async function setRank(uuid, name, rank) {
   if (rank === "invitado") await api("DELETE", "/api/admin/members/" + uuid);
-  else await api("PUT", "/api/admin/members/" + uuid, { name, rank });
+  else await api("PUT", "/api/admin/members/" + uuid, { name: name || null, rank });
   await refresh();
 }
 
@@ -875,7 +876,7 @@ function renderPlayers() {
     const n = document.createElement("span"); n.className = "p-name"; n.textContent = p.name;
     const u = document.createElement("span"); u.className = "p-uuid mono"; u.textContent = p.uuid;
     const x = document.createElement("button"); x.className = "x"; x.title = "Quitar de la whitelist"; x.textContent = "✕";
-    x.disabled = me.rank !== "owner" && level(p.rank) >= level(me.rank);
+    x.disabled = me.id !== "web" && me.rank !== "owner" && level(p.rank) >= level(me.rank);
     x.addEventListener("click", async () => {
       try {
         ev.players = (await api("DELETE", "/api/admin/events/" + ev.id + "/players/" + p.uuid)).players;
@@ -891,7 +892,7 @@ function renderPlayers() {
 function renderMembers() {
   const list = $("members");
   list.replaceChildren();
-  const shown = members.filter((m) => m.rank !== "invitado");
+  const shown = members.filter((m) => m.fixed || m.rank !== "invitado");
   if (shown.length === 0) {
     const li = document.createElement("li");
     li.className = "hint";
@@ -902,12 +903,12 @@ function renderMembers() {
     const li = document.createElement("li");
     const n = document.createElement("span"); n.className = "p-name"; n.textContent = m.name || "(sin nombre)";
     const u = document.createElement("span"); u.className = "p-uuid mono";
-    u.textContent = m.fixed ? m.uuid + " · Owner fijo (ADMIN_UUIDS)" : m.uuid;
+    u.textContent = m.fixed ? m.uuid + " · ADMIN_UUIDS" : m.uuid;
     li.append(n, rankControl(m), u);
     if (canChange(m)) {
       const x = document.createElement("button"); x.className = "x"; x.title = "Quitar rango (pasa a Invitado)"; x.textContent = "✕";
       x.addEventListener("click", async () => {
-        try { await setRank(m.uuid, m.name, "invitado"); toast(m.name + " vuelve a ser Invitado", "ok"); }
+        try { await setRank(m.uuid, m.name, "invitado"); toast((m.name || "La cuenta") + " vuelve a ser Invitado", "ok"); }
         catch (err) { toast(err.message, "err"); }
       });
       li.appendChild(x);

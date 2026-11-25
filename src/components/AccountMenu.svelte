@@ -37,6 +37,9 @@
     {#if app.account}
       <SkinFace url={app.account.skin_url} username={app.account.username} size={26} />
       <span class="name">{app.account.username}</span>
+      {#if app.me?.rank}
+        <span class="rank sm {app.me.rank}" title="Tu rango en los eventos">{RANK_NAMES[app.me.rank]}</span>
+      {/if}
     {:else}
       <span class="anon"><Icon name="user" size={15} /></span>
       <span class="name">{app.signInBusy ? "Conectando…" : "Iniciar sesión"}</span>
@@ -170,6 +173,11 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+  }
+  .rank.sm {
+    height: 18px;
+    padding: 0 7px;
+    font-size: 10.5px;
   }
   .profile .rank {
     align-self: flex-start;

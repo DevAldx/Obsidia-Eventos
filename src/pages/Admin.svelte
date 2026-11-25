@@ -81,7 +81,7 @@
     rankBusy = false;
   }
 
-  const shownMembers = $derived(members.filter((m) => m.rank !== "invitado"));
+  const shownMembers = $derived(members.filter((m) => m.fixed || m.rank !== "invitado"));
 
   let list = $state<AdminEvent[]>([]);
   let loading = $state(false);
@@ -527,7 +527,7 @@
       {/each}
     </select>
   {:else}
-    <span class="rank {rank}" title={isFixed(uuid) ? "Owner fijo (ADMIN_UUIDS del servidor)" : undefined}>{RANK_NAMES[rank]}</span>
+    <span class="rank {rank}" title={isFixed(uuid) ? "Cuenta de ADMIN_UUIDS: su rango se cambia desde el panel web" : undefined}>{RANK_NAMES[rank]}</span>
   {/if}
 {/snippet}
 
@@ -566,7 +566,7 @@
           <li>
             <span class="p-name">{m.name ?? "(sin nombre)"}</span>
             {@render rankControl(m.uuid, m.name, m.rank)}
-            <span class="p-uuid mono">{m.uuid}{m.fixed ? " · Owner fijo" : ""}</span>
+            <span class="p-uuid mono">{m.uuid}{m.fixed ? " · ADMIN_UUIDS (se cambia desde el panel web)" : ""}</span>
             {#if canActOn(m)}
               <button class="icon-btn" title="Quitar rango (pasa a Invitado)" disabled={rankBusy} onclick={() => changeRank(m.uuid, m.name, "invitado")}>
                 <Icon name="close" size={14} />
