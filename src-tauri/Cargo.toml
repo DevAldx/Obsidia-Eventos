@@ -1,6 +1,6 @@
 [package]
 name = "obsidia-eventos"
-version = "0.2.1-dev"
+version = "0.2.2-dev"
 edition = "2021"
 rust-version = "1.77"
 license = "MIT"
