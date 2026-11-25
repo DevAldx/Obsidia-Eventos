@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "obsidia-core"
-version = "0.5.0"
+version = "0.2.0-dev"
 dependencies = [
  "base64 0.22.1",
  "directories",
