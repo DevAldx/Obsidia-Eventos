@@ -26,5 +26,13 @@ DAILY_PACKS = "50"
 ADMIN_UUIDS = "a6e6588335244eaeb2008c74c6b27223"
 
 # Secretos (NO van aquí):
-#   npx wrangler secret put SECRET       # firma de sesiones: openssl rand -base64 48
-#   npx wrangler secret put SERVER_KEY   # clave del servidor de Minecraft: openssl rand -hex 24
+#   npx wrangler secret put SECRET          # firma de sesiones: openssl rand -base64 48
+#   npx wrangler secret put SERVER_KEY      # clave del servidor de Minecraft: openssl rand -hex 24
+#   npx wrangler secret put ADMIN_PASSWORD  # panel web (12+ caracteres): openssl rand -base64 24
+
+# Opcional: limitador de Cloudflare para el login del panel web (5 intentos por
+# minuto e IP) antes de tocar KV. El bloqueo por IP funciona igual sin esto.
+# [[ratelimits]]
+# name = "LOGIN_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 5, period = 60 }

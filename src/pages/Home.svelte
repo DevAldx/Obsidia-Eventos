@@ -113,7 +113,7 @@
           <button class="btn primary" onclick={() => app.loadEvents()} disabled={app.eventsLoading}>
             <Icon name="refresh" size={15} /> {app.eventsLoading ? "Comprobando…" : "Comprobar de nuevo"}
           </button>
-          {#if app.me?.admin}
+          {#if app.me?.permissions.manage_events}
             <button class="btn" onclick={() => nav.go("admin")}><Icon name="settings" size={15} /> Crear un evento</button>
           {/if}
         </div>
@@ -132,7 +132,7 @@
           {:else}
             <span class="tag ember" title="Minecraft, Java y los mods del evento se descargan al pulsar Jugar.">Se descargará al jugar</span>
           {/if}
-          {#if !event.active}<span class="tag ember">Cerrado · solo admins</span>{/if}
+          {#if !event.active}<span class="tag ember">Cerrado · solo el equipo</span>{/if}
           <span class="tag">{loaderText(event)}</span>
           <span class="tag">Minecraft {event.minecraft_version}</span>
         </div>

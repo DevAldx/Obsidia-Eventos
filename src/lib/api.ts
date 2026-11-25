@@ -18,6 +18,8 @@ import type {
   AdminEvent,
   EventInput,
   Player,
+  MembersView,
+  Rank,
 } from "./types";
 
 /** Los comandos de Rust fallan con `{ message }`; lo normalizamos a Error. */
@@ -90,6 +92,9 @@ export const api = {
     call<Player[]>("admin_players_add", { id, players }),
   adminPlayerRemove: (id: string, uuid: string) =>
     call<Player[]>("admin_player_remove", { id, uuid }),
+  adminMembersList: () => call<MembersView>("admin_members_list"),
+  adminMemberSet: (uuid: string, name: string, rank: Rank) =>
+    call<void>("admin_member_set", { uuid, name, rank }),
 };
 
 /** "-Xmx2G -XX:+UseG1GC" → ["-Xmx2G", "-XX:+UseG1GC"] */

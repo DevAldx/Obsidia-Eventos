@@ -246,9 +246,31 @@ export interface EventInfo {
   updated: string | null;
 }
 
+/** Rangos globales, de menor a mayor. */
+export const RANKS = ["invitado", "miembro", "staff", "developer", "owner"] as const;
+export type Rank = (typeof RANKS)[number];
+export const RANK_NAMES: Record<Rank, string> = {
+  invitado: "Invitado",
+  miembro: "Miembro",
+  staff: "Staff",
+  developer: "Developer",
+  owner: "Owner",
+};
+export const rankLevel = (r: string | null | undefined) => RANKS.indexOf((r ?? "invitado") as Rank);
+
+export interface Permissions {
+  manage_whitelist: boolean;
+  manage_ranks: boolean;
+  manage_events: boolean;
+  assignable: Rank[];
+}
+
 export interface MyEvents {
   uuid: string;
+  /** Staff o superior. */
   admin: boolean;
+  rank: Rank | null;
+  permissions: Permissions;
   events: EventInfo[];
 }
 
@@ -256,6 +278,20 @@ export interface Player {
   uuid: string;
   name: string;
   added?: string;
+  /** Rango global al leer; al añadir, el que se asigna (sin él no se cambia). */
+  rank?: Rank;
+}
+
+export interface Member {
+  uuid: string;
+  name: string | null;
+  rank: Rank;
+  fixed: boolean;
+}
+
+export interface MembersView {
+  members: Member[];
+  assignable: Rank[];
 }
 
 export interface AdminEvent {

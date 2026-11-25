@@ -233,6 +233,22 @@ select.input:disabled, .field select:disabled { cursor: default; }
 .tag.ok { color: var(--success); border-color: rgb(61 220 132 / 0.35); background: rgb(61 220 132 / 0.08); }
 .tag.ember { color: var(--ember); border-color: rgb(255 138 76 / 0.35); background: rgb(255 138 76 / 0.08); }
 
+/* Rangos */
+.rank {
+  display: inline-flex; align-items: center;
+  height: 22px; padding: 0 9px;
+  border-radius: 999px;
+  font-size: 11px; font-weight: 650;
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  white-space: nowrap;
+  flex: none;
+}
+.rank.owner { color: #ffd479; border-color: rgb(255 212 121 / 0.4); background: rgb(255 212 121 / 0.08); }
+.rank.developer { color: #7ec8ff; border-color: rgb(126 200 255 / 0.4); background: rgb(126 200 255 / 0.08); }
+.rank.staff { color: var(--accent-hover); border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.rank.miembro { color: var(--success); border-color: rgb(61 220 132 / 0.35); background: rgb(61 220 132 / 0.08); }
+
 /* Punto de estado */
 .dot { width: 8px; height: 8px; border-radius: 2px; background: var(--muted); flex: none; }
 .dot.ok { background: var(--success); }

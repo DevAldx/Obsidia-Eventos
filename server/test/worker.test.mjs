@@ -289,7 +289,9 @@ test("whitelist: solo ve el evento quien está en la lista", async () => {
   // Whitelist para el servidor de Minecraft.
   const wlPath = `/api/server/${event.id}/whitelist.json`;
   assert.equal((await call(env, "GET", wlPath)).status, 401);
-  assert.equal((await call(env, "GET", `${wlPath}?key=mala`)).status, 401);
+  assert.equal((await call(env, "GET", wlPath, { token: "mala" })).status, 401);
+  // La clave en la URL ya no se acepta (ni siquiera la buena): acabaría en los registros.
+  assert.equal((await call(env, "GET", `${wlPath}?key=${SERVER_KEY}`)).status, 400);
   const wl = await (await call(env, "GET", wlPath, { token: SERVER_KEY })).json();
   assert.deepEqual(wl, [{ uuid: dashedPlayer, name: "Jugador_1" }]);
 
@@ -385,6 +387,217 @@ test("panel web: contraseña, token propio y búsqueda de jugadores", async () =
   assert.equal(added.status, 200);
   const mine = await (await call(env, "GET", "/api/events", { token: playerToken })).json();
   assert.deepEqual(mine.events.map((e) => e.id), [ev.id]);
+});
+
+test("panel web: bloquea la fuerza bruta por IP", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+  const login = (password, ip = "203.0.113.7") =>
+    call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password }), headers: { "cf-connecting-ip": ip } });
+
+  for (let i = 1; i < 5; i++) {
+    const res = await login(`mala-${i}`);
+    assert.equal(res.status, 401);
+    assert.match((await res.json()).error, new RegExp(`te quedan ${5 - i}`));
+  }
+  const locked = await login("mala-5");
+  assert.equal(locked.status, 429);
+  assert.ok(Number(locked.headers.get("retry-after")) > 0);
+  // Bloqueada, ni la contraseña buena entra desde esa IP...
+  assert.equal((await login("contraseña-larga-de-prueba")).status, 429);
+  // ...pero otra IP sí puede.
+  assert.equal((await login("contraseña-larga-de-prueba", "198.51.100.2")).status, 200);
+
+  // Un acierto borra los fallos acumulados de esa IP.
+  assert.equal((await login("mala", "192.0.2.9")).status, 401);
+  assert.equal((await login("contraseña-larga-de-prueba", "192.0.2.9")).status, 200);
+  const again = await login("mala", "192.0.2.9");
+  assert.match((await again.json()).error, /te quedan 4/);
+
+  // No guarda las IPs en claro.
+  const keys = [...(env.BUCKET ?? env.FILES).store.keys()].filter((k) => k.startsWith("web/fails/"));
+  assert.ok(keys.length > 0 && keys.every((k) => !k.includes("203.0.113.7")));
+
+  // Con el limitador de Cloudflare configurado, también lo respeta.
+  const limited = { ...env, LOGIN_LIMITER: { limit: async () => ({ success: false }) } };
+  const res = await call(limited, "POST", "/api/admin/web-login", {
+    body: JSON.stringify({ password: "contraseña-larga-de-prueba" }),
+    headers: { "cf-connecting-ip": "198.51.100.50" },
+  });
+  assert.equal(res.status, 429);
+
+  // Cuerpos enormes en el login público: rechazados sin procesarlos.
+  const big = await call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: "x".repeat(10000) }) });
+  assert.equal(big.status, 413);
+});
+
+test("panel web: salir, cerrar todas las sesiones y cambiar la contraseña", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+  const loginToken = async (e = env) =>
+    (await (await call(e, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: e.ADMIN_PASSWORD }) })).json()).token;
+  const canAdmin = async (token, e = env) => (await call(e, "GET", "/api/admin/events", { token })).status;
+
+  // «Salir» invalida ese token en el servidor, no los demás.
+  const a = await loginToken();
+  const b = await loginToken();
+  assert.equal(await canAdmin(a), 200);
+  assert.equal((await call(env, "POST", "/api/admin/logout", { token: a })).status, 204);
+  assert.equal(await canAdmin(a), 401);
+  assert.equal(await canAdmin(b), 200);
+  // Salir con un token inválido o sin token no falla.
+  assert.equal((await call(env, "POST", "/api/admin/logout", { token: "web.basura" })).status, 204);
+  assert.equal((await call(env, "POST", "/api/admin/logout")).status, 204);
+
+  // «Cerrar todas las sesiones» tumba todos los tokens emitidos antes.
+  assert.equal((await call(env, "POST", "/api/admin/logout-all")).status, 401);
+  assert.equal((await call(env, "POST", "/api/admin/logout-all", { token: await tokenOf(env, PLAYER) })).status, 403);
+  assert.equal((await call(env, "POST", "/api/admin/logout-all", { token: b })).status, 204);
+  assert.equal(await canAdmin(b), 401);
+  await new Promise((r) => setTimeout(r, 1100)); // los tokens van por segundos
+  const c = await loginToken();
+  assert.equal(await canAdmin(c), 200, "un login nuevo sí vale");
+
+  // Cambiar ADMIN_PASSWORD invalida todas las sesiones abiertas.
+  const changed = { ...env, ADMIN_PASSWORD: "otra-contraseña-nueva-123" };
+  assert.equal(await canAdmin(c, changed), 401);
+  assert.equal(await canAdmin(await loginToken(changed), changed), 200);
+  // Y quitarla del todo también.
+  assert.equal(await canAdmin(c, { ...env, ADMIN_PASSWORD: undefined }), 401);
+
+  // Un token web antiguo (formato sin huella de contraseña) no vale.
+  assert.equal(await canAdmin(c.split(".").filter((_, i) => i !== 1 && i !== 2).join(".")), 401);
+});
+
+test("panel web: cabeceras de seguridad", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+  for (const path of ["/admin", "/admin/app.js"]) {
+    const res = await call(env, "GET", path);
+    const csp = res.headers.get("content-security-policy");
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.match(csp, /script-src 'self'/);
+    assert.doesNotMatch(csp, /script-src[^;]*unsafe/);
+    assert.equal(res.headers.get("x-frame-options"), "DENY");
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    assert.match(res.headers.get("strict-transport-security"), /max-age=\d+/);
+    assert.equal(res.headers.get("cache-control"), "no-store");
+  }
+  const api = await call(env, "GET", "/");
+  assert.equal(api.headers.get("x-content-type-options"), "nosniff");
+  // El panel no usa innerHTML: así puede exigir Trusted Types.
+  assert.doesNotMatch(await (await call(env, "GET", "/admin/app.js")).text(), /innerHTML|outerHTML|insertAdjacentHTML|eval\(/);
+});
+
+test("rangos: cada uno solo puede lo suyo", async () => {
+  const env = { ...makeEnv(), ADMIN_PASSWORD: "contraseña-larga-de-prueba" };
+  const DEV = "d".repeat(32);
+  const STAFF = "5".repeat(32);
+  const MEMBER = "1".repeat(32);
+  const GUEST = "9".repeat(32);
+  const owner = await tokenOf(env); // UUID está en ADMIN_UUIDS: owner fijo
+  const setRank = (token, uuid, name, rank) =>
+    call(env, "PUT", `/api/admin/members/${uuid}`, { token, body: JSON.stringify({ name, rank }) });
+
+  // Al principio todos son invitados: no pueden administrar nada.
+  const guest = await tokenOf(env, GUEST);
+  assert.equal((await call(env, "GET", "/api/admin/members", { token: guest })).status, 403);
+  const meGuest = await (await call(env, "GET", "/api/events", { token: guest })).json();
+  assert.equal(meGuest.rank, "invitado");
+  assert.equal(meGuest.admin, false);
+
+  // El owner reparte rangos.
+  assert.equal((await setRank(owner, DEV, "Dev_1", "developer")).status, 200);
+  assert.equal((await setRank(owner, STAFF, "Staff_1", "staff")).status, 200);
+  assert.equal((await setRank(owner, "a".repeat(32), "x", "rey")).status, 400, "rango inexistente");
+  // Nadie cambia a un owner fijo, ni siquiera otro owner.
+  assert.equal((await setRank(owner, UUID, "Yo", "miembro")).status, 403);
+
+  const dev = await tokenOf(env, DEV);
+  const staff = await tokenOf(env, STAFF);
+
+  // Lo que ve cada uno al abrir el launcher.
+  const meStaff = await (await call(env, "GET", "/api/events", { token: staff })).json();
+  assert.equal(meStaff.rank, "staff");
+  assert.equal(meStaff.admin, true);
+  assert.deepEqual(meStaff.permissions, {
+    manage_whitelist: true,
+    manage_ranks: true,
+    manage_events: false,
+    assignable: ["invitado", "miembro"],
+  });
+  const meDev = await (await call(env, "GET", "/api/events", { token: dev })).json();
+  assert.equal(meDev.permissions.manage_events, true);
+  assert.deepEqual(meDev.permissions.assignable, ["invitado", "miembro", "staff"]);
+
+  // Developer crea eventos; Staff no.
+  const created = await post(env, "/api/admin/events", dev, { name: "Del dev", minecraft_version: "1.21.1", active: false });
+  assert.equal(created.status, 201);
+  const ev = await created.json();
+  assert.equal((await post(env, "/api/admin/events", staff, { name: "x", minecraft_version: "1.21.1" })).status, 403);
+  assert.equal((await call(env, "DELETE", `/api/admin/events/${ev.id}`, { token: staff })).status, 403);
+
+  // El equipo ve todos los eventos (aunque estén cerrados y no esté en la whitelist).
+  const staffEvents = await (await call(env, "GET", "/api/events", { token: staff })).json();
+  assert.deepEqual(staffEvents.events.map((e) => e.id), [ev.id]);
+  assert.equal((await (await call(env, "GET", "/api/events", { token: guest })).json()).events.length, 0);
+
+  // Staff añade a la whitelist y da Miembro, pero no Staff ni superior.
+  const players = `/api/admin/events/${ev.id}/players`;
+  const addedMember = await post(env, players, staff, { players: [{ uuid: MEMBER, name: "Miembro_1", rank: "miembro" }] });
+  assert.equal(addedMember.status, 200);
+  assert.deepEqual((await addedMember.json()).players.map((p) => [p.name, p.rank]), [["Miembro_1", "miembro"]]);
+  const tooHigh = await post(env, players, staff, { players: [{ uuid: GUEST, name: "Invitado_1", rank: "staff" }] });
+  assert.equal(tooHigh.status, 403);
+  assert.match((await tooHigh.json()).error, /Invitado_1/);
+  // Si uno falla, no se añade ninguno.
+  const mixed = await post(env, players, staff, {
+    players: [
+      { uuid: GUEST, name: "Invitado_1" },
+      { uuid: DEV, name: "Dev_1", rank: "miembro" },
+    ],
+  });
+  assert.equal(mixed.status, 403);
+  const afterMixed = await (await call(env, "GET", "/api/admin/events", { token: staff })).json();
+  assert.equal(afterMixed.events[0].players.length, 1);
+  // Sin `rank` se añade sin tocar su rango (aunque sea mayor que el suyo).
+  const plain = await post(env, players, staff, { players: [{ uuid: DEV, name: "Dev_1" }] });
+  assert.equal(plain.status, 200);
+  assert.equal((await plain.json()).players.find((p) => p.uuid === DEV).rank, "developer");
+
+  // Staff no puede quitar de la whitelist a un Developer; sí a un Miembro.
+  assert.equal((await call(env, "DELETE", `${players}/${DEV}`, { token: staff })).status, 403);
+  assert.equal((await call(env, "DELETE", `${players}/${MEMBER}`, { token: staff })).status, 200);
+
+  // Developer da Staff, pero no Developer ni Owner, y no toca a otro Developer.
+  assert.equal((await setRank(dev, MEMBER, "Miembro_1", "staff")).status, 200);
+  assert.equal((await setRank(dev, GUEST, "Invitado_1", "developer")).status, 403);
+  assert.equal((await setRank(dev, GUEST, "Invitado_1", "owner")).status, 403);
+  assert.equal((await setRank(dev, DEV, "Dev_1", "staff")).status, 403, "ni a sí mismo");
+  // Staff no puede bajar a otro Staff.
+  assert.equal((await setRank(staff, MEMBER, "Miembro_1", "miembro")).status, 403);
+  assert.equal((await call(env, "DELETE", `/api/admin/members/${MEMBER}`, { token: staff })).status, 403);
+  assert.equal((await call(env, "DELETE", `/api/admin/members/${MEMBER}`, { token: dev })).status, 204);
+
+  // La lista de rangos: owner fijo primero, luego de mayor a menor.
+  const list = await (await call(env, "GET", "/api/admin/members", { token: staff })).json();
+  assert.deepEqual(list.me, { id: STAFF, rank: "staff" });
+  assert.deepEqual(list.assignable, ["invitado", "miembro"]);
+  assert.deepEqual(list.members.map((m) => [m.uuid, m.rank, !!m.fixed]), [
+    [UUID, "owner", true],
+    [DEV, "developer", false],
+    [STAFF, "staff", false],
+  ]);
+
+  // El panel web (contraseña) es owner: puede dar Owner, y ese owner nuevo puede dar Developer.
+  const web = (await (await call(env, "POST", "/api/admin/web-login", { body: JSON.stringify({ password: env.ADMIN_PASSWORD }) })).json()).token;
+  assert.equal((await setRank(web, GUEST, "Invitado_1", "owner")).status, 200);
+  const newOwner = await tokenOf(env, GUEST);
+  assert.equal((await setRank(newOwner, MEMBER, "Miembro_1", "developer")).status, 200);
+  // Solo un owner cierra todas las sesiones del panel.
+  assert.equal((await call(env, "POST", "/api/admin/logout-all", { token: dev })).status, 403);
+
+  // El servidor de Minecraft deja entrar al equipo aunque no esté en la whitelist del evento.
+  const wl = await (await call(env, "GET", `/api/server/${ev.id}/whitelist.json`, { token: SERVER_KEY })).json();
+  const names = wl.map((p) => p.name).sort();
+  assert.deepEqual(names, ["Dev_1", "Invitado_1", "Miembro_1", "Staff_1"]);
 });
 
 test("panel web: sin ADMIN_PASSWORD no se puede entrar", async () => {

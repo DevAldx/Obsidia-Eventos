@@ -61,10 +61,43 @@ fn yes() -> bool {
     true
 }
 
+/// Rangos globales, de menor a mayor (los decide el servidor de eventos).
+pub const RANKS: [&str; 5] = ["invitado", "miembro", "staff", "developer", "owner"];
+
+/// Qué puede hacer la cuenta en el panel de administración.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Permissions {
+    #[serde(default)]
+    pub manage_whitelist: bool,
+    #[serde(default)]
+    pub manage_ranks: bool,
+    #[serde(default)]
+    pub manage_events: bool,
+    /// Rangos que puede dar.
+    #[serde(default)]
+    pub assignable: Vec<String>,
+}
+
+impl Permissions {
+    fn owner() -> Self {
+        Self {
+            manage_whitelist: true,
+            manage_ranks: true,
+            manage_events: true,
+            assignable: RANKS.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MyEvents {
     pub uuid: String,
+    /// Staff o superior: ve la pestaña Admin y entra a todos los eventos.
     pub admin: bool,
+    #[serde(default)]
+    pub rank: Option<String>,
+    #[serde(default)]
+    pub permissions: Permissions,
     pub events: Vec<EventInfo>,
 }
 
@@ -75,6 +108,28 @@ pub struct Player {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added: Option<String>,
+    /// Al leer: su rango global. Al añadir: el rango que se le asigna (None = no cambiarlo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<String>,
+}
+
+/// Una cuenta con rango (vista de administración).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub uuid: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub rank: String,
+    /// Owner fijo (ADMIN_UUIDS del servidor): su rango no se puede cambiar.
+    #[serde(default)]
+    pub fixed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembersView {
+    pub members: Vec<Member>,
+    #[serde(default)]
+    pub assignable: Vec<String>,
 }
 
 /// Evento completo (vista de administración, con la whitelist).
@@ -211,7 +266,36 @@ pub async fn my_events(s: &Session) -> Result<MyEvents> {
     let mut me: MyEvents = get_json(s, "/api/events").await?;
     // Nada que no tenga un ID de evento válido llega a convertirse en carpeta.
     me.events.retain(|e| event_id(&e.id).is_ok());
+    // Servidor anterior a los rangos: sus admins lo podían todo.
+    if me.rank.is_none() && me.admin {
+        me.rank = Some("owner".into());
+        me.permissions = Permissions::owner();
+    }
     Ok(me)
+}
+
+pub async fn admin_members(s: &Session) -> Result<MembersView> {
+    get_json(s, "/api/admin/members").await
+}
+
+/// Da un rango global a una cuenta. `invitado` le quita el rango que tuviera.
+pub async fn admin_member_set(s: &Session, uuid: &str, name: &str, rank: &str) -> Result<()> {
+    let uuid = normalize_uuid(uuid).ok_or_else(|| CoreError::invalid("UUID inválido"))?;
+    if !valid_name(name) {
+        return Err(CoreError::invalid(format!("nombre inválido: {name}")));
+    }
+    if !RANKS.contains(&rank) {
+        return Err(CoreError::invalid(format!("rango inválido: {rank}")));
+    }
+    let http = share_upload::http_client()?;
+    let url = format!("{}/api/admin/members/{uuid}", s.base);
+    let req = if rank == "invitado" {
+        http.delete(url)
+    } else {
+        http.put(url).json(&serde_json::json!({ "name": name, "rank": rank }))
+    };
+    check(req.bearer_auth(&s.token).send().await.map_err(net(WHAT))?, WHAT).await?;
+    Ok(())
 }
 
 pub async fn admin_list(s: &Session) -> Result<Vec<AdminEvent>> {
@@ -317,6 +401,7 @@ pub async fn resolve_player(query: &str) -> Result<Player> {
         uuid,
         name: profile.name,
         added: None,
+        rank: None,
     })
 }
 
@@ -436,6 +521,24 @@ mod tests {
         assert!(valid_name("Jugador_1"));
         assert!(!valid_name("con espacio"));
         assert!(!valid_name("a".repeat(17).as_str()));
+    }
+
+    #[test]
+    fn ranks_from_server() {
+        // Servidor nuevo: rango y permisos tal cual.
+        let me: MyEvents = serde_json::from_str(
+            r#"{"uuid":"a","admin":true,"rank":"staff","permissions":{"manage_whitelist":true,"manage_ranks":true,"manage_events":false,"assignable":["invitado","miembro"]},"events":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(me.rank.as_deref(), Some("staff"));
+        assert!(!me.permissions.manage_events);
+        assert_eq!(me.permissions.assignable, ["invitado", "miembro"]);
+        // Servidor antiguo: sin rango; los permisos quedan vacíos (my_events los completa).
+        let old: MyEvents = serde_json::from_str(r#"{"uuid":"a","admin":true,"events":[]}"#).unwrap();
+        assert!(old.rank.is_none() && !old.permissions.manage_events);
+        // El rango del jugador solo se envía si se quiere cambiar.
+        let p = Player { uuid: "u".into(), name: "n".into(), added: None, rank: None };
+        assert!(!serde_json::to_string(&p).unwrap().contains("rank"));
     }
 
     #[test]

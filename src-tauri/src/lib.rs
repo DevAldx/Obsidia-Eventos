@@ -10,7 +10,7 @@ use std::{
 use obsidia_core::{
     auth::{self, Account, AccountKind, AccountStore, AuthEndpoints, AuthFlow},
     config::Settings,
-    events::{self, AdminEvent, EventInput, MyEvents, Player},
+    events::{self, AdminEvent, EventInput, MembersView, MyEvents, Player},
     instances::{InstanceId, InstanceList, InstanceStore},
     java::{self, JavaRuntime},
     launcher::{self, LaunchAuth, LaunchInput, Screen},
@@ -1082,6 +1082,27 @@ async fn admin_players_add(
     .await
 }
 
+/// Cuentas con rango y los rangos que puede dar quien pregunta.
+#[tauri::command]
+async fn admin_members_list(state: State<'_, AppState>) -> CmdResult<MembersView> {
+    with_event_session(&state, |s| async move { events::admin_members(&s).await }).await
+}
+
+/// Da un rango global (`invitado` se lo quita). El servidor comprueba si se puede.
+#[tauri::command]
+async fn admin_member_set(
+    state: State<'_, AppState>,
+    uuid: String,
+    name: String,
+    rank: String,
+) -> CmdResult<()> {
+    with_event_session(&state, |s| {
+        let (uuid, name, rank) = (uuid.clone(), name.clone(), rank.clone());
+        async move { events::admin_member_set(&s, &uuid, &name, &rank).await }
+    })
+    .await
+}
+
 #[tauri::command]
 async fn admin_player_remove(
     state: State<'_, AppState>,
@@ -1855,6 +1876,8 @@ pub fn run() {
             admin_resolve_player,
             admin_players_add,
             admin_player_remove,
+            admin_members_list,
+            admin_member_set,
             stop_instance,
             game_states,
             fetch_news,

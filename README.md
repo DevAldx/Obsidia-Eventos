@@ -75,6 +75,10 @@ del panel de administración.
    a la vez, separados por comas o saltos de línea). El launcher los busca en
    Mojang y los añade.
 5. Desmarca **Abierto** para ocultar el evento a los jugadores sin borrarlo.
+6. **Reparte rangos** (Owner, Developer, Staff, Miembro, Invitado) en **Admin →
+   Rangos**, o elige el rango al añadir a alguien a la whitelist. Staff gestiona
+   whitelists; Developer además crea y edita eventos. Ver
+   [`server/README.md`](server/README.md#rangos).
 
 Quien no esté en ninguna whitelist ve «Acceso restringido» con su nombre y su
 UUID listos para copiar y mandárselos al organizador.

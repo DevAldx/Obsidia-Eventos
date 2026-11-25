@@ -3,9 +3,85 @@
   import { app } from "../lib/app.svelte";
   import { api, DEFAULT_SHARE_URL } from "../lib/api";
   import { toasts } from "../lib/toast.svelte";
-  import type { AdminEvent, EventInput, Loader, Player } from "../lib/types";
+  import { RANKS, RANK_NAMES, rankLevel } from "../lib/types";
+  import type { AdminEvent, EventInput, Loader, Member, Player, Rank } from "../lib/types";
   import Icon from "../components/Icon.svelte";
   import Modal from "../components/Modal.svelte";
+
+  // ───── Rangos ─────
+  const myRank = $derived<Rank>(app.me?.rank ?? "invitado");
+  const canEvents = $derived(app.me?.permissions.manage_events ?? false);
+  let members = $state<Member[]>([]);
+  let assignable = $state<Rank[]>([]);
+  /** Rango que se asigna al añadir a la whitelist ("" = no cambiarlo). */
+  let addRank = $state<Rank | "">("miembro");
+  let ranksOpen = $state(false);
+  let memberQuery = $state("");
+  let memberRank = $state<Rank>("miembro");
+  let rankBusy = $state(false);
+  const ranksDesc = [...RANKS].reverse();
+
+  async function loadMembers() {
+    try {
+      const view = await api.adminMembersList();
+      members = view.members;
+      assignable = view.assignable;
+      if (addRank && !assignable.includes(addRank)) addRank = "";
+      if (!assignable.includes(memberRank)) memberRank = assignable.at(-1) ?? "invitado";
+    } catch (e) {
+      toasts.error(e, "No se pudieron cargar los rangos");
+    }
+  }
+
+  const isFixed = (uuid: string) => members.some((m) => m.fixed && m.uuid === uuid);
+  /** ¿Puedo tocar a esta cuenta? Owner a cualquiera (menos los fijos); el resto, solo a rangos inferiores. */
+  const canActOn = (p: { uuid: string; rank?: Rank | null }) =>
+    !isFixed(p.uuid) && (myRank === "owner" || rankLevel(p.rank) < rankLevel(myRank));
+  const canRemoveFromList = (p: Player) => myRank === "owner" || rankLevel(p.rank) < rankLevel(myRank);
+
+  async function changeRank(uuid: string, name: string | null, rank: Rank) {
+    if (!name) {
+      toasts.error("Esta cuenta no tiene nombre conocido; añádela con su nombre");
+      return;
+    }
+    rankBusy = true;
+    try {
+      await api.adminMemberSet(uuid, name, rank);
+      toasts.success(`${name} ahora es ${RANK_NAMES[rank]}`);
+      await Promise.all([loadMembers(), load()]);
+    } catch (e) {
+      toasts.error(e, "No se pudo cambiar el rango");
+      await loadMembers();
+    } finally {
+      rankBusy = false;
+    }
+  }
+
+  async function addMembers() {
+    const queries = memberQuery.split(/[\s,;]+/).map((q) => q.trim()).filter(Boolean);
+    if (queries.length === 0) return;
+    rankBusy = true;
+    const failed: string[] = [];
+    const errors: string[] = [];
+    let ok = 0;
+    for (const q of queries) {
+      try {
+        const p = await api.adminResolvePlayer(q);
+        await api.adminMemberSet(p.uuid, p.name, memberRank);
+        ok++;
+      } catch (e) {
+        failed.push(q);
+        errors.push(`${q}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    if (ok > 0) toasts.success(`${ok} cuenta(s) con rango ${RANK_NAMES[memberRank]}`);
+    if (errors.length > 0) toasts.error(errors.join("\n"), "No se pudo con");
+    memberQuery = failed.join("\n");
+    await Promise.all([loadMembers(), load()]);
+    rankBusy = false;
+  }
+
+  const shownMembers = $derived(members.filter((m) => m.rank !== "invitado"));
 
   let list = $state<AdminEvent[]>([]);
   let loading = $state(false);
@@ -85,7 +161,10 @@
     }
   }
 
-  onMount(load);
+  onMount(() => {
+    void load();
+    void loadMembers();
+  });
 
   function open(id: string | null) {
     openId = id;
@@ -162,8 +241,15 @@
     }
     try {
       if (found.length > 0) {
-        ev.players = await api.adminPlayersAdd(ev.id, found);
-        toasts.success(`${found.length} jugador(es) añadidos a la whitelist`);
+        const rank = addRank || undefined;
+        ev.players = await api.adminPlayersAdd(
+          ev.id,
+          found.map((p) => ({ ...p, rank })),
+        );
+        toasts.success(
+          `${found.length} jugador(es) añadidos a la whitelist${rank ? ` como ${RANK_NAMES[rank]}` : ""}`,
+        );
+        if (rank) await Promise.all([loadMembers(), load()]);
       }
       playerQuery = failed.length > 0 ? queries.filter((q) => failed.some((f) => f.startsWith(`${q}:`))).join("\n") : "";
       if (failed.length > 0) toasts.error(failed.join("\n"), "No se encontraron");
@@ -208,9 +294,15 @@
       <p class="eyebrow">Eventos</p>
       <div class="head-actions">
         <button class="btn sm" onclick={() => openWhitelist()}><Icon name="user" size={14} /> Whitelist</button>
-        <button class="btn sm primary" onclick={() => open("new")}><Icon name="plus" size={14} /> Nuevo</button>
+        {#if canEvents}
+          <button class="btn sm primary" onclick={() => open("new")}><Icon name="plus" size={14} /> Nuevo</button>
+        {/if}
       </div>
     </div>
+    <button class="item ranks-item" onclick={() => (ranksOpen = true)}>
+      <span class="item-name">Rangos</span>
+      <span class="item-meta">Tu rango: <span class="rank {myRank}">{RANK_NAMES[myRank]}</span></span>
+    </button>
     {#if loading && list.length === 0}
       <div class="skeleton item-skel"></div>
       <div class="skeleton item-skel"></div>
@@ -238,8 +330,13 @@
         <Icon name="settings" size={32} />
         <h2 class="display">Panel de organizadores</h2>
         <p class="hint">
-          Crea eventos y decide quién entra. Solo ven un evento las cuentas de su whitelist; el resto ve
-          «Acceso restringido». Los cambios se aplican al momento.
+          {#if canEvents}
+            Crea eventos y decide quién entra. Solo ven un evento las cuentas de su whitelist; el resto ve
+            «Acceso restringido». Los cambios se aplican al momento.
+          {:else}
+            Como {RANK_NAMES[myRank]} puedes gestionar la whitelist de los eventos y dar rangos inferiores
+            al tuyo. Crear y editar eventos es cosa de Developer u Owner.
+          {/if}
         </p>
       </div>
     {:else}
@@ -254,12 +351,17 @@
               <button class="btn sm primary" onclick={() => openWhitelist(current.id)}>
                 <Icon name="user" size={14} /> Whitelist ({current.players.length})
               </button>
-              <button class="btn danger-soft sm" onclick={remove}><Icon name="trash" size={14} /> Borrar</button>
+              {#if canEvents}
+                <button class="btn danger-soft sm" onclick={remove}><Icon name="trash" size={14} /> Borrar</button>
+              {/if}
             </div>
           {/if}
         </div>
 
-        <div class="grid">
+        {#if !canEvents}
+          <p class="alert info">Solo Developer u Owner pueden editar el evento. Tú puedes gestionar su whitelist.</p>
+        {/if}
+        <fieldset class="grid" disabled={!canEvents}>
           <label class="field wide">
             <span>Nombre</span>
             <input bind:value={draft.name} maxlength="48" placeholder="Torneo de invierno" />
@@ -307,7 +409,7 @@
             <input type="checkbox" bind:checked={draft.active} />
             <span>Abierto: los jugadores de la whitelist lo ven y pueden jugar</span>
           </label>
-        </div>
+        </fieldset>
         {#if usesPack}
           <p class="hint">
             Con pack, la versión, el loader y los mods salen del pack. Súbelo desde Obsidia normal con
@@ -315,11 +417,13 @@
             de eventos ({serverUrl}). Al jugar, los mods que no estén en el pack se borran.
           </p>
         {/if}
-        <div class="actions">
-          <button class="btn primary" onclick={save} disabled={saving || !draft.name.trim()}>
-            {saving ? "Guardando…" : openId === "new" ? "Crear evento" : "Guardar cambios"}
-          </button>
-        </div>
+        {#if canEvents}
+          <div class="actions">
+            <button class="btn primary" onclick={save} disabled={saving || !draft.name.trim()}>
+              {saving ? "Guardando…" : openId === "new" ? "Crear evento" : "Guardar cambios"}
+            </button>
+          </div>
+        {/if}
 
         {#if current}
           <p class="hint">Para decidir quién entra, pulsa <strong>Whitelist</strong> arriba.</p>
@@ -359,11 +463,19 @@
               placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"
               onkeydown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), addPlayers())}
             ></textarea>
-            <button class="btn primary" onclick={addPlayers} disabled={adding || !playerQuery.trim()}>
-              <Icon name="plus" size={15} /> {adding ? "Buscando…" : "Añadir"}
-            </button>
+            <div class="add-side">
+              <select bind:value={addRank} title="Rango que se les asigna al añadirlos">
+                <option value="">Sin cambiar rango</option>
+                {#each ranksDesc as r (r)}
+                  {#if assignable.includes(r)}<option value={r}>{RANK_NAMES[r]}</option>{/if}
+                {/each}
+              </select>
+              <button class="btn primary" onclick={addPlayers} disabled={adding || !playerQuery.trim()}>
+                <Icon name="plus" size={15} /> {adding ? "Buscando…" : "Añadir"}
+              </button>
+            </div>
           </div>
-          <p class="hint">Enter para añadir · Shift+Enter para otra línea.</p>
+          <p class="hint">Enter para añadir · Shift+Enter para otra línea. El rango elegido es para todos los eventos.</p>
           {#if wlEvent.players.length > 8}
             <input class="filter" bind:value={filter} placeholder="Buscar en la whitelist…" />
           {/if}
@@ -371,8 +483,13 @@
             {#each shownPlayers as p (p.uuid)}
               <li>
                 <span class="p-name">{p.name}</span>
+                {@render rankControl(p.uuid, p.name, p.rank ?? "invitado")}
                 <span class="p-uuid mono">{p.uuid}</span>
-                <button class="icon-btn" title="Quitar de la whitelist" onclick={() => removePlayer(p)}><Icon name="close" size={14} /></button>
+                <button
+                  class="icon-btn"
+                  title={canRemoveFromList(p) ? "Quitar de la whitelist" : "No puedes quitar a alguien con tu rango o superior"}
+                  disabled={!canRemoveFromList(p)}
+                  onclick={() => removePlayer(p)}><Icon name="close" size={14} /></button>
               </li>
             {:else}
               <li class="hint">Nadie todavía. Añade a los participantes arriba.</li>
@@ -396,7 +513,116 @@
   </Modal>
 {/if}
 
+{#snippet rankControl(uuid: string, name: string | null, rank: Rank)}
+  {#if canActOn({ uuid, rank })}
+    <select
+      class="rank-select"
+      value={rank}
+      disabled={rankBusy}
+      title="Cambiar rango (vale para todos los eventos)"
+      onchange={(e) => changeRank(uuid, name, (e.currentTarget as HTMLSelectElement).value as Rank)}
+    >
+      {#each ranksDesc as r (r)}
+        {#if assignable.includes(r) || r === rank}<option value={r}>{RANK_NAMES[r]}</option>{/if}
+      {/each}
+    </select>
+  {:else}
+    <span class="rank {rank}" title={isFixed(uuid) ? "Owner fijo (ADMIN_UUIDS del servidor)" : undefined}>{RANK_NAMES[rank]}</span>
+  {/if}
+{/snippet}
+
+{#if ranksOpen}
+  <Modal title="Rangos" subtitle="Un rango por persona, para todos los eventos" width={660} busy={rankBusy} onclose={() => (ranksOpen = false)}>
+    <div class="whitelist">
+      <div class="legend">
+        <span class="rank owner">Owner</span><span>Todo, incluido dar cualquier rango.</span>
+        <span class="rank developer">Developer</span><span>Crear y editar eventos y mods, whitelist, dar rangos hasta Staff.</span>
+        <span class="rank staff">Staff</span><span>Whitelist y dar Miembro o Invitado. Entra a todos los eventos.</span>
+        <span class="rank miembro">Miembro</span><span>Juega los eventos en cuya whitelist está.</span>
+        <span class="rank">Invitado</span><span>Igual que Miembro. Es el rango de quien no tiene ninguno.</span>
+      </div>
+      {#if assignable.length > 0}
+        <div class="add">
+          <textarea
+            bind:value={memberQuery}
+            rows="2"
+            placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"
+            onkeydown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), addMembers())}
+          ></textarea>
+          <div class="add-side">
+            <select bind:value={memberRank}>
+              {#each ranksDesc as r (r)}
+                {#if assignable.includes(r)}<option value={r}>{r === "invitado" ? "Invitado (quitar rango)" : RANK_NAMES[r]}</option>{/if}
+              {/each}
+            </select>
+            <button class="btn primary" onclick={addMembers} disabled={rankBusy || !memberQuery.trim()}>
+              {rankBusy ? "Guardando…" : "Dar rango"}
+            </button>
+          </div>
+        </div>
+      {/if}
+      <ul class="players">
+        {#each shownMembers as m (m.uuid)}
+          <li>
+            <span class="p-name">{m.name ?? "(sin nombre)"}</span>
+            {@render rankControl(m.uuid, m.name, m.rank)}
+            <span class="p-uuid mono">{m.uuid}{m.fixed ? " · Owner fijo" : ""}</span>
+            {#if canActOn(m)}
+              <button class="icon-btn" title="Quitar rango (pasa a Invitado)" disabled={rankBusy} onclick={() => changeRank(m.uuid, m.name, "invitado")}>
+                <Icon name="close" size={14} />
+              </button>
+            {/if}
+          </li>
+        {:else}
+          <li class="hint">Nadie tiene rango todavía: todos son Invitado.</li>
+        {/each}
+      </ul>
+    </div>
+  </Modal>
+{/if}
+
 <style>
+  fieldset.grid {
+    border: none;
+    margin: 0;
+    padding: 0;
+    min-width: 0;
+  }
+  fieldset.grid:disabled {
+    opacity: 0.7;
+  }
+  .ranks-item {
+    margin-bottom: 8px;
+    border-color: var(--border);
+  }
+  .add-side {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .rank-select {
+    width: auto;
+    padding: 3px 8px;
+    font-size: 12px;
+    flex: none;
+  }
+  .legend {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 12px;
+    align-items: center;
+    font-size: 13px;
+    color: var(--text-2);
+  }
+  .legend .rank {
+    justify-self: start;
+  }
+  .icon-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+    background: none;
+    color: var(--muted);
+  }
   .admin {
     display: grid;
     grid-template-columns: 280px 1fr;

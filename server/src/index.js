@@ -14,19 +14,25 @@ import { ADMIN_HTML, ADMIN_JS } from "./admin-page.js";
 // Jugadores (con sesión):
 //   GET  /api/events             -> { uuid, admin, events } solo los eventos donde está en la whitelist
 //
-// Administración (UUID en ADMIN_UUIDS):
-//   GET    /api/admin/events                      todos los eventos con su whitelist
-//   POST   /api/admin/events                      crear evento
-//   PUT    /api/admin/events/<EVT-XXXXXX>         editar evento
-//   DELETE /api/admin/events/<EVT-XXXXXX>         borrar evento
-//   POST   /api/admin/events/<id>/players         { players: [{ uuid, name }] } añadir a la whitelist
-//   DELETE /api/admin/events/<id>/players/<uuid>  quitar de la whitelist
-//   PUT    /api/files/<sha1>, POST /api/packs     subir el pack del evento (desde Obsidia normal)
-//   DELETE /api/packs/<code>
+// Administración (según el rango; ver RANKS más abajo):
+//   GET    /api/admin/events                      todos los eventos con su whitelist        (Staff+)
+//   POST   /api/admin/events                      crear evento                               (Developer+)
+//   PUT    /api/admin/events/<EVT-XXXXXX>         editar evento                              (Developer+)
+//   DELETE /api/admin/events/<EVT-XXXXXX>         borrar evento                              (Developer+)
+//   POST   /api/admin/events/<id>/players         { players: [{ uuid, name, rank? }] }       (Staff+)
+//   DELETE /api/admin/events/<id>/players/<uuid>  quitar de la whitelist                     (Staff+)
+//   GET    /api/admin/members                     rangos de todo el mundo                    (Staff+)
+//   PUT    /api/admin/members/<uuid>              { name, rank } dar un rango                (Staff+)
+//   DELETE /api/admin/members/<uuid>              quitar el rango (vuelve a Invitado)        (Staff+)
+//   PUT    /api/files/<sha1>, POST /api/packs     subir el pack del evento                   (Developer+)
+//   DELETE /api/packs/<code>                                                                  (Developer+)
 //
 // Panel web (contraseña ADMIN_PASSWORD):
 //   GET  /admin                                  la página del panel
 //   POST /api/admin/web-login    { password }    -> { token } sesión web de admin (12 h)
+//                                                 5 fallos en 15 min bloquean la IP 15 min
+//   POST /api/admin/logout                       cierra la sesión web actual en el servidor
+//   POST /api/admin/logout-all                   cierra todas las sesiones web (admin)
 //   GET  /api/admin/resolve?q=<nombre|uuid>      -> { uuid, name } (admin)
 //   GET  /api/admin/packs/<OBS-XXXXXX>           el manifiesto de un pack (admin)
 //
@@ -70,8 +76,28 @@ const LOADER_VERSION_RE = /^[A-Za-z0-9._-]{1,32}$/;
 // host o host:puerto (sin esquema).
 const SERVER_ADDRESS_RE = /^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::\d{1,5})?$/;
 
+// Rangos globales (uno por persona para todos los eventos), de menor a mayor.
+//   owner      todo, incluido dar cualquier rango
+//   developer  crear/editar eventos y packs, whitelist, dar rangos hasta staff
+//   staff      whitelist, dar miembro/invitado; entra a todos los eventos
+//   miembro    jugar (si está en la whitelist del evento)
+//   invitado   jugar (si está en la whitelist del evento); el rango por defecto
+// Las cuentas de ADMIN_UUIDS y el panel web (contraseña) son owner fijos.
+const RANKS = ["invitado", "miembro", "staff", "developer", "owner"];
+const RANK_NAMES = { invitado: "Invitado", miembro: "Miembro", staff: "Staff", developer: "Developer", owner: "Owner" };
+const MEMBERS_KEY = "members/index.json";
+const MAX_MEMBERS = 5000;
+
 const WEB_TOKEN_TTL_S = 12 * 60 * 60;
 const WEB_ADMIN = "web";
+const WEB_SESSIONS_KEY = "web/sessions.json";
+// Fuerza bruta: 5 contraseñas mal en 15 minutos bloquean esa IP 15 minutos.
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_WINDOW_S = 15 * 60;
+const LOGIN_LOCK_S = 15 * 60;
+// Tamaño máximo del cuerpo en las rutas de login (públicas).
+const MAX_WEB_LOGIN_BODY = 4 * 1024;
+const MAX_LOGIN_BODY = 16 * 1024;
 
 const enc = new TextEncoder();
 
@@ -83,7 +109,7 @@ export default {
       if (!env.BUCKET) throw new HttpError(500, "falta configurar el almacenamiento (FILES o BUCKET en wrangler.toml)");
       return await route(request, env);
     } catch (e) {
-      if (e instanceof HttpError) return json({ error: e.message }, e.status);
+      if (e instanceof HttpError) return json({ error: e.message }, e.status, e.headers);
       console.error(e);
       return json({ error: "error interno del servidor" }, 500);
     }
@@ -91,17 +117,35 @@ export default {
 };
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, headers = {}) {
     super(message);
     this.status = status;
+    this.headers = headers;
   }
 }
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json; charset=utf-8", ...headers },
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      ...headers,
+    },
   });
+}
+
+/** Lee un JSON pequeño sin aceptar cuerpos enormes (para las rutas públicas). */
+async function readSmallJson(request, max) {
+  if (Number(request.headers.get("content-length")) > max) throw new HttpError(413, "petición demasiado grande");
+  const text = await request.text();
+  if (text.length > max) throw new HttpError(413, "petición demasiado grande");
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 /** Workers KV: un valor no puede pasar de 25 MiB. */
@@ -130,7 +174,11 @@ function kvBucket(kv) {
     head: get,
     async put(key, value, opts = {}) {
       const bytes = typeof value === "string" ? enc.encode(value) : new Uint8Array(value);
-      await kv.put(key, bytes, { metadata: { size: bytes.byteLength, custom: opts.customMetadata ?? {} } });
+      await kv.put(key, bytes, {
+        metadata: { size: bytes.byteLength, custom: opts.customMetadata ?? {} },
+        // KV borra solo las claves temporales (mínimo 60 s). R2 lo ignora.
+        ...(opts.expirationTtl ? { expirationTtl: Math.max(60, Math.ceil(opts.expirationTtl)) } : {}),
+      });
     },
     async delete(key) {
       await kv.delete(key);
@@ -163,6 +211,8 @@ async function route(request, env) {
   if ((path === "/admin" || path === "/admin/") && method === "GET") return page(ADMIN_HTML, "text/html");
   if (path === "/admin/app.js" && method === "GET") return page(ADMIN_JS, "text/javascript");
   if (path === "/api/admin/web-login" && method === "POST") return webLogin(request, env);
+  if (path === "/api/admin/logout" && method === "POST") return webLogout(request, env);
+  if (path === "/api/admin/logout-all" && method === "POST") return webLogoutAll(request, env);
   if (path === "/api/admin/resolve" && method === "GET") return adminResolve(request, env, url);
 
   let m = path.match(/^\/files\/([0-9a-f]{40})$/);
@@ -173,6 +223,7 @@ async function route(request, env) {
     return new Response(method === "HEAD" ? null : obj.body, {
       headers: {
         "content-type": "application/octet-stream",
+        "x-content-type-options": "nosniff",
         "content-length": String(obj.size),
         // El contenido de una ruta es su propio hash: nunca cambia.
         "cache-control": "private, max-age=31536000, immutable",
@@ -207,6 +258,11 @@ async function route(request, env) {
   if (m && method === "POST") return adminAddPlayers(request, env, m[1]);
   m = path.match(/^\/api\/admin\/events\/(EVT-[A-Z0-9]{6})\/players\/([0-9a-fA-F-]{32,36})$/);
   if (m && method === "DELETE") return adminRemovePlayer(request, env, m[1], m[2]);
+
+  if (path === "/api/admin/members" && method === "GET") return adminListMembers(request, env);
+  m = path.match(/^\/api\/admin\/members\/([0-9a-fA-F-]{32,36})$/);
+  if (m && method === "PUT") return adminSetMember(request, env, m[1]);
+  if (m && method === "DELETE") return adminRemoveMember(request, env, m[1]);
 
   return json({ error: "ruta no encontrada" }, 404);
 }
@@ -291,7 +347,7 @@ async function mojangSignedKey(env, uuid, expiresAtMs, spki, signature) {
 }
 
 async function login(request, env) {
-  const body = await request.json().catch(() => null);
+  const body = await readSmallJson(request, MAX_LOGIN_BODY);
   const uuid = String(body?.uuid ?? "").replace(/-/g, "").toLowerCase();
   if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID no válido");
   const ticket = body?.ticket;
@@ -492,15 +548,147 @@ function isAdmin(env, uuid) {
     .includes(uuid);
 }
 
-async function requireAdmin(request, env) {
+// ───────────────────────────── Rangos ─────────────────────────────
+
+const level = (rank) => RANKS.indexOf(rank);
+
+async function readMembers(env) {
+  const obj = await env.BUCKET.get(MEMBERS_KEY);
+  const data = obj ? await obj.json().catch(() => null) : null;
+  return Array.isArray(data?.items) ? data : { items: [] };
+}
+
+const writeMembers = (env, members) => env.BUCKET.put(MEMBERS_KEY, JSON.stringify(members));
+
+/** Rango de una cuenta: owner fijo (ADMIN_UUIDS), el de la lista de miembros o invitado. */
+function rankIn(env, members, uuid) {
+  if (isAdmin(env, uuid)) return "owner";
+  const rank = members.items.find((m) => m.uuid === uuid)?.rank;
+  return RANKS.includes(rank) ? rank : "invitado";
+}
+
+/** Quién hace la petición y con qué rango. El panel web (contraseña) es owner. */
+async function requireActor(request, env) {
   const auth = request.headers.get("authorization") ?? "";
   if (auth.startsWith(`Bearer ${WEB_ADMIN}.`)) {
-    await verify(env, "webadmin", auth.slice(7), 1);
-    return WEB_ADMIN;
+    await requireWebSession(env, auth.slice(7));
+    return { id: WEB_ADMIN, rank: "owner", members: await readMembers(env) };
   }
   const uuid = await requireUser(request, env);
-  if (!isAdmin(env, uuid)) throw new HttpError(403, "solo los administradores del evento pueden hacer esto");
-  return uuid;
+  const members = await readMembers(env);
+  return { id: uuid, rank: rankIn(env, members, uuid), members };
+}
+
+async function requireRank(request, env, min) {
+  const actor = await requireActor(request, env);
+  if (level(actor.rank) < level(min)) {
+    throw new HttpError(403, `necesitas el rango ${RANK_NAMES[min]} o superior para hacer esto`);
+  }
+  return actor;
+}
+
+/** Crear y editar eventos y packs: Developer o superior. Devuelve quién lo hace. */
+async function requireAdmin(request, env) {
+  return (await requireRank(request, env, "developer")).id;
+}
+
+/** Rangos que puede dar `actor`: owner cualquiera; el resto, solo inferiores al suyo. */
+const assignableBy = (actor) => (actor.rank === "owner" ? [...RANKS] : RANKS.filter((r) => level(r) < level(actor.rank)));
+
+function permissionsOf(rank) {
+  const l = level(rank);
+  return {
+    manage_whitelist: l >= level("staff"),
+    manage_ranks: l >= level("staff"),
+    manage_events: l >= level("developer"),
+    assignable: assignableBy({ rank }),
+  };
+}
+
+/** ¿Puede `actor` tocar a esta cuenta (quitarla de una whitelist, cambiar su rango)? */
+function checkCanActOn(env, actor, uuid) {
+  if (actor.rank === "owner") return;
+  if (level(rankIn(env, actor.members, uuid)) >= level(actor.rank)) {
+    throw new HttpError(403, "no puedes cambiar a alguien con tu rango o superior");
+  }
+}
+
+function checkRankChange(env, actor, uuid, rank) {
+  if (!RANKS.includes(rank)) throw new HttpError(400, `rango inválido: ${rank}`);
+  if (isAdmin(env, uuid)) {
+    throw new HttpError(403, "esa cuenta es Owner fijo (ADMIN_UUIDS en wrangler.toml); su rango no se cambia aquí");
+  }
+  checkCanActOn(env, actor, uuid);
+  if (!assignableBy(actor).includes(rank)) {
+    throw new HttpError(403, `no puedes dar el rango ${RANK_NAMES[rank]}: solo rangos inferiores al tuyo`);
+  }
+}
+
+/** Aplica un rango ya comprobado. Invitado es el rango por defecto: no se guarda. */
+function applyRank(members, uuid, name, rank, by) {
+  members.items = members.items.filter((m) => m.uuid !== uuid);
+  if (rank !== "invitado") {
+    members.items.push({ uuid, name, rank, updated: new Date().toISOString(), updated_by: by });
+  }
+  if (members.items.length > MAX_MEMBERS) throw new HttpError(507, `no se pueden tener más de ${MAX_MEMBERS} miembros con rango`);
+}
+
+/** La whitelist de un evento con el rango de cada jugador. */
+const withRanks = (env, members, players) => (players ?? []).map((p) => ({ ...p, rank: rankIn(env, members, p.uuid) }));
+
+const eventWithRanks = (env, members, event) => ({ ...event, players: withRanks(env, members, event.players) });
+
+/** Nombre conocido de una cuenta (miembros o whitelists), para los owners fijos. */
+function knownName(members, events, uuid) {
+  return (
+    members.items.find((m) => m.uuid === uuid)?.name ??
+    events.items.flatMap((e) => e.players ?? []).find((p) => p.uuid === uuid)?.name ??
+    null
+  );
+}
+
+function fixedOwners(env) {
+  return String(env.ADMIN_UUIDS ?? "")
+    .split(",")
+    .map((u) => u.trim().replace(/-/g, "").toLowerCase())
+    .filter((u) => UUID_RE.test(u));
+}
+
+async function adminListMembers(request, env) {
+  const actor = await requireRank(request, env, "staff");
+  const events = await readEvents(env);
+  const fixed = fixedOwners(env).map((uuid) => ({ uuid, name: knownName(actor.members, events, uuid), rank: "owner", fixed: true }));
+  const members = actor.members.items.filter((m) => !isAdmin(env, m.uuid) && RANKS.includes(m.rank));
+  members.sort((a, b) => level(b.rank) - level(a.rank) || a.name.localeCompare(b.name));
+  return json(
+    { me: { id: actor.id, rank: actor.rank }, assignable: assignableBy(actor), members: [...fixed, ...members] },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
+async function adminSetMember(request, env, rawUuid) {
+  const actor = await requireRank(request, env, "staff");
+  const uuid = rawUuid.replace(/-/g, "").toLowerCase();
+  if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
+  const body = await request.json().catch(() => null);
+  const name = String(body?.name ?? "");
+  if (!MC_NAME_RE.test(name)) throw new HttpError(400, `nombre inválido: ${name}`);
+  const rank = String(body?.rank ?? "");
+  checkRankChange(env, actor, uuid, rank);
+  applyRank(actor.members, uuid, name, rank, actor.id);
+  await writeMembers(env, actor.members);
+  return json({ uuid, name, rank });
+}
+
+async function adminRemoveMember(request, env, rawUuid) {
+  const actor = await requireRank(request, env, "staff");
+  const uuid = rawUuid.replace(/-/g, "").toLowerCase();
+  if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
+  checkRankChange(env, actor, uuid, "invitado");
+  applyRank(actor.members, uuid, null, "invitado", actor.id);
+  await writeMembers(env, actor.members);
+  return new Response(null, { status: 204 });
 }
 
 function cleanText(value, max) {
@@ -579,22 +767,34 @@ async function playerView(env, event) {
 
 async function listMyEvents(request, env) {
   const uuid = await requireUser(request, env);
-  const admin = isAdmin(env, uuid);
+  const rank = rankIn(env, await readMembers(env), uuid);
+  // El equipo (Staff o superior) ve y puede entrar a todos los eventos, también los cerrados.
+  const team = level(rank) >= level("staff");
   const events = await readEvents(env);
   const mine = events.items.filter(
-    (e) => admin || (e.active !== false && (e.players ?? []).some((p) => p.uuid === uuid)),
+    (e) => team || (e.active !== false && (e.players ?? []).some((p) => p.uuid === uuid)),
   );
   return json(
-    { uuid, admin, events: await Promise.all(mine.map((e) => playerView(env, e))) },
+    {
+      uuid,
+      rank,
+      admin: team,
+      permissions: permissionsOf(rank),
+      events: await Promise.all(mine.map((e) => playerView(env, e))),
+    },
     200,
     { "cache-control": "no-store" },
   );
 }
 
 async function adminListEvents(request, env) {
-  await requireAdmin(request, env);
+  const actor = await requireRank(request, env, "staff");
   const events = await readEvents(env);
-  return json({ events: events.items }, 200, { "cache-control": "no-store" });
+  return json(
+    { events: events.items.map((e) => eventWithRanks(env, actor.members, e)) },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
 
 function parseMemory(value) {
@@ -689,7 +889,7 @@ async function adminSaveEvent(request, env, id) {
     updated: new Date().toISOString(),
   });
   await writeEvents(env, events);
-  return json(event, id ? 200 : 201);
+  return json(eventWithRanks(env, await readMembers(env), event), id ? 200 : 201);
 }
 
 async function adminDeleteEvent(request, env, id) {
@@ -701,48 +901,74 @@ async function adminDeleteEvent(request, env, id) {
   return new Response(null, { status: 204 });
 }
 
+/**
+ * Añade jugadores a la whitelist (Staff o superior). Cada uno puede llevar
+ * `rank`: si cambia su rango global, se comprueba que quien lo pide pueda darlo.
+ * Todo se valida antes de guardar nada: o entran todos o ninguno.
+ */
 async function adminAddPlayers(request, env, id) {
-  const admin = await requireAdmin(request, env);
+  const actor = await requireRank(request, env, "staff");
   const body = await request.json().catch(() => null);
   const list = Array.isArray(body?.players) ? body.players : null;
   if (!list || list.length === 0 || list.length > 500) throw new HttpError(400, "envía entre 1 y 500 jugadores");
   const events = await readEvents(env);
   const event = findEvent(events, id);
   event.players ??= [];
-  for (const p of list) {
+
+  const parsed = list.map((p) => {
     const uuid = String(p?.uuid ?? "").replace(/-/g, "").toLowerCase();
     const name = String(p?.name ?? "");
     if (!UUID_RE.test(uuid)) throw new HttpError(400, `UUID inválido: ${p?.uuid}`);
     if (!MC_NAME_RE.test(name)) throw new HttpError(400, `nombre inválido: ${name}`);
+    const rank = p?.rank == null ? null : String(p.rank);
+    if (rank !== null && rank !== rankIn(env, actor.members, uuid)) {
+      try {
+        checkRankChange(env, actor, uuid, rank);
+      } catch (e) {
+        if (e instanceof HttpError) throw new HttpError(e.status, `${name}: ${e.message}`);
+        throw e;
+      }
+    }
+    return { uuid, name, rank };
+  });
+
+  let ranksChanged = false;
+  for (const { uuid, name, rank } of parsed) {
     const existing = event.players.find((x) => x.uuid === uuid);
     if (existing) existing.name = name;
-    else event.players.push({ uuid, name, added: new Date().toISOString(), added_by: admin });
+    else event.players.push({ uuid, name, added: new Date().toISOString(), added_by: actor.id });
+    if (rank !== null && rank !== rankIn(env, actor.members, uuid)) {
+      applyRank(actor.members, uuid, name, rank, actor.id);
+      ranksChanged = true;
+    }
   }
   if (event.players.length > MAX_PLAYERS_PER_EVENT) {
     throw new HttpError(507, `un evento no puede tener más de ${MAX_PLAYERS_PER_EVENT} jugadores`);
   }
   event.updated = new Date().toISOString();
+  if (ranksChanged) await writeMembers(env, actor.members);
   await writeEvents(env, events);
-  return json({ players: event.players });
+  return json({ players: withRanks(env, actor.members, event.players) });
 }
 
 async function adminRemovePlayer(request, env, id, rawUuid) {
-  await requireAdmin(request, env);
+  const actor = await requireRank(request, env, "staff");
   const uuid = rawUuid.replace(/-/g, "").toLowerCase();
   if (!UUID_RE.test(uuid)) throw new HttpError(400, "UUID inválido");
+  checkCanActOn(env, actor, uuid);
   const events = await readEvents(env);
   const event = findEvent(events, id);
   event.players = (event.players ?? []).filter((p) => p.uuid !== uuid);
   event.updated = new Date().toISOString();
   await writeEvents(env, events);
-  return json({ players: event.players });
+  return json({ players: withRanks(env, actor.members, event.players) });
 }
 
 // ───────────────────────────── Panel web ─────────────────────────────
 
 const PAGE_CSP =
   "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self' https://meta.fabricmc.net https://api.modrinth.com; img-src 'self' data: https://cdn.modrinth.com; " +
-  "form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+  "form-action 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; require-trusted-types-for 'script'";
 
 function page(body, type) {
   return new Response(body, {
@@ -750,29 +976,144 @@ function page(body, type) {
       "content-type": `${type}; charset=utf-8`,
       "content-security-policy": PAGE_CSP,
       "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
       "referrer-policy": "no-referrer",
+      "strict-transport-security": "max-age=31536000",
+      "cross-origin-opener-policy": "same-origin",
+      "cross-origin-resource-policy": "same-origin",
+      "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
       "cache-control": "no-store",
     },
   });
 }
+
+/** Compara dos secretos sin filtrar su longitud ni su contenido por tiempos. */
+async function sameSecret(env, given, expected) {
+  return safeEqual(await hmac(env, `cmp:${given}`), await hmac(env, `cmp:${expected}`));
+}
+
+/**
+ * Huella de la contraseña dentro del token web: si se cambia ADMIN_PASSWORD,
+ * todas las sesiones abiertas dejan de valer.
+ */
+async function passwordFingerprint(env, password) {
+  return (await hmac(env, `pwfp:${password}`)).slice(0, 16);
+}
+
+/** Identificador de la IP para el bloqueo por fuerza bruta (no se guarda la IP en claro). */
+async function clientKey(env, request) {
+  const ip = request.headers.get("cf-connecting-ip") ?? "local";
+  return (await hmac(env, `ip:${ip}`)).slice(0, 22);
+}
+
+const tooManyAttempts = (seconds) =>
+  new HttpError(
+    429,
+    `demasiados intentos fallidos; espera ${Math.max(1, Math.ceil(seconds / 60))} min antes de volver a probar`,
+    { "retry-after": String(Math.max(1, Math.ceil(seconds))) },
+  );
 
 async function webLogin(request, env) {
   const expected = String(env.ADMIN_PASSWORD ?? "");
   if (expected.length < 12) {
     throw new HttpError(503, "falta configurar ADMIN_PASSWORD (wrangler secret put ADMIN_PASSWORD, 12+ caracteres)");
   }
-  const body = await request.json().catch(() => null);
-  const given = String(body?.password ?? "");
-  // Compara los HMAC (misma longitud siempre) para no filtrar nada por tiempos.
-  if (!safeEqual(await hmac(env, `pw:${given}`), await hmac(env, `pw:${expected}`))) {
-    throw new HttpError(401, "contraseña incorrecta");
+  const now = Math.floor(Date.now() / 1000);
+  const ipKey = await clientKey(env, request);
+
+  // Límite rápido de Cloudflare si está configurado (LOGIN_LIMITER en wrangler.toml).
+  if (env.LOGIN_LIMITER) {
+    const { success } = await env.LOGIN_LIMITER.limit({ key: ipKey });
+    if (!success) throw tooManyAttempts(60);
   }
-  return json({ token: await sign(env, "webadmin", [WEB_ADMIN], WEB_TOKEN_TTL_S) }, 200, { "cache-control": "no-store" });
+
+  // Bloqueo persistente: cuenta los fallos de cada IP.
+  const failKey = `web/fails/${ipKey}`;
+  const failObj = await env.BUCKET.get(failKey);
+  let fails = failObj ? await failObj.json().catch(() => null) : null;
+  if (fails?.locked_until > now) throw tooManyAttempts(fails.locked_until - now);
+  if (!(fails?.window_end > now)) fails = { count: 0, window_end: now + LOGIN_WINDOW_S, locked_until: 0 };
+
+  const body = await readSmallJson(request, MAX_WEB_LOGIN_BODY);
+  const given = String(body?.password ?? "");
+  if (!(await sameSecret(env, given, expected))) {
+    fails.count += 1;
+    if (fails.count >= LOGIN_MAX_FAILS) fails.locked_until = now + LOGIN_LOCK_S;
+    await env.BUCKET.put(failKey, JSON.stringify(fails), {
+      expirationTtl: Math.max(fails.window_end, fails.locked_until) - now,
+    });
+    if (fails.locked_until > now) throw tooManyAttempts(LOGIN_LOCK_S);
+    const left = LOGIN_MAX_FAILS - fails.count;
+    throw new HttpError(401, `contraseña incorrecta (te quedan ${left} intento${left === 1 ? "" : "s"})`);
+  }
+  if (failObj) await env.BUCKET.delete(failKey);
+
+  const sid = hex(crypto.getRandomValues(new Uint8Array(12)));
+  const fp = await passwordFingerprint(env, expected);
+  return json({ token: await sign(env, "webadmin", [WEB_ADMIN, sid, fp], WEB_TOKEN_TTL_S) }, 200, {
+    "cache-control": "no-store",
+  });
+}
+
+// Sesiones web: el token es stateless (firmado), pero se puede revocar.
+//   - «Salir» apunta su id en `revoked` hasta que caduca.
+//   - «Cerrar todas las sesiones» mueve `not_before`: los tokens emitidos antes dejan de valer.
+async function readWebSessions(env) {
+  const obj = await env.BUCKET.get(WEB_SESSIONS_KEY);
+  const d = obj ? await obj.json().catch(() => null) : null;
+  return {
+    not_before: Number(d?.not_before) || 0,
+    revoked: d?.revoked && typeof d.revoked === "object" ? d.revoked : {},
+  };
+}
+
+async function writeWebSessions(env, sessions) {
+  const now = Date.now() / 1000;
+  for (const [sid, exp] of Object.entries(sessions.revoked)) if (!(exp > now)) delete sessions.revoked[sid];
+  await env.BUCKET.put(WEB_SESSIONS_KEY, JSON.stringify(sessions));
+}
+
+async function requireWebSession(env, token) {
+  const [, sid, fp] = await verify(env, "webadmin", token, 3);
+  const exp = Number(token.split(".")[3]);
+  const password = String(env.ADMIN_PASSWORD ?? "");
+  if (password.length < 12 || !safeEqual(fp, await passwordFingerprint(env, password))) {
+    throw new HttpError(401, "la contraseña del panel ha cambiado; vuelve a entrar");
+  }
+  const sessions = await readWebSessions(env);
+  if (sessions.revoked[sid] || exp - WEB_TOKEN_TTL_S <= sessions.not_before) {
+    throw new HttpError(401, "la sesión se ha cerrado; vuelve a entrar");
+  }
+  return { sid, exp };
+}
+
+/** Cierra la sesión web actual en el servidor (no solo en el navegador). */
+async function webLogout(request, env) {
+  const auth = request.headers.get("authorization") ?? "";
+  if (auth.startsWith(`Bearer ${WEB_ADMIN}.`)) {
+    const session = await requireWebSession(env, auth.slice(7)).catch(() => null);
+    if (session) {
+      const sessions = await readWebSessions(env);
+      sessions.revoked[session.sid] = session.exp;
+      await writeWebSessions(env, sessions);
+    }
+  }
+  return new Response(null, { status: 204 });
+}
+
+/** Cierra todas las sesiones del panel web (por ejemplo, si se perdió un portátil). */
+async function webLogoutAll(request, env) {
+  await requireRank(request, env, "owner");
+  const sessions = await readWebSessions(env);
+  sessions.not_before = Math.floor(Date.now() / 1000);
+  sessions.revoked = {};
+  await writeWebSessions(env, sessions);
+  return new Response(null, { status: 204 });
 }
 
 /** Nombre o UUID → { uuid, name }. Mojang suele bloquear a Cloudflare, así que hay respaldo. */
 async function adminResolve(request, env, url) {
-  await requireAdmin(request, env);
+  await requireRank(request, env, "staff");
   const q = String(url.searchParams.get("q") ?? "").trim();
   const uuidQuery = q.replace(/-/g, "").toLowerCase();
   const isUuid = UUID_RE.test(uuidQuery);
@@ -817,11 +1158,24 @@ async function adminResolve(request, env, url) {
 async function serverWhitelist(request, env, url, id) {
   const expected = String(env.SERVER_KEY ?? "");
   if (expected.length < 24) throw new HttpError(503, "falta configurar SERVER_KEY (wrangler secret put SERVER_KEY)");
+  // Solo en la cabecera: en la URL (?key=) acabaría en registros e historiales.
   const auth = request.headers.get("authorization") ?? "";
-  const given = auth.startsWith("Bearer ") ? auth.slice(7) : (url.searchParams.get("key") ?? "");
-  if (!safeEqual(given, expected)) throw new HttpError(401, "clave de servidor incorrecta");
+  if (url.searchParams.has("key")) {
+    throw new HttpError(400, "la clave va en la cabecera Authorization: Bearer <SERVER_KEY>, no en la URL");
+  }
+  const given = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!given || !(await sameSecret(env, given, expected))) throw new HttpError(401, "clave de servidor incorrecta");
   const events = await readEvents(env);
   const event = findEvent(events, id);
-  const list = (event.players ?? []).map((p) => ({ uuid: dashed(p.uuid), name: p.name }));
+  // La whitelist del evento más el equipo (Staff o superior), que entra a todos.
+  const members = await readMembers(env);
+  const byUuid = new Map();
+  for (const p of event.players ?? []) byUuid.set(p.uuid, p.name);
+  for (const m of members.items) if (level(m.rank) >= level("staff")) byUuid.set(m.uuid, m.name);
+  for (const uuid of fixedOwners(env)) {
+    const name = knownName(members, events, uuid);
+    if (name) byUuid.set(uuid, name);
+  }
+  const list = [...byUuid].map(([uuid, name]) => ({ uuid: dashed(uuid), name }));
   return json(list, 200, { "cache-control": "no-store" });
 }

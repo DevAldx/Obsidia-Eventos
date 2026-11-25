@@ -4,6 +4,7 @@
   import { nav } from "../lib/nav.svelte";
   import SkinFace from "./SkinFace.svelte";
   import Icon from "./Icon.svelte";
+  import { RANK_NAMES } from "../lib/types";
 
   let open = $state(false);
   let root = $state<HTMLDivElement | null>(null);
@@ -52,6 +53,9 @@
           <div>
             <strong>{app.account.username}</strong>
             <span class="hint">{kindLabel}</span>
+            {#if app.me?.rank}
+              <span class="rank {app.me.rank}" title="Tu rango en los eventos">{RANK_NAMES[app.me.rank]}</span>
+            {/if}
           </div>
         </div>
         {#if app.account.kind === "offline"}
@@ -166,6 +170,10 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+  }
+  .profile .rank {
+    align-self: flex-start;
+    margin-top: 4px;
   }
   .profile strong {
     font-size: 15px;

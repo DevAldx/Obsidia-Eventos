@@ -45,6 +45,47 @@ Desde ahí se crean y editan eventos y se gestiona la whitelist (por nombre o
 UUID; el Worker busca la cuenta en Mojang y, si Cloudflare está bloqueado,
 en playerdb.co). La sesión web dura 12 horas y solo vale para administrar.
 
+### Rangos
+
+Cada cuenta tiene **un rango para todos los eventos**. Se da desde el panel web
+(sección **Rangos**, o el selector al añadir a la whitelist) o desde la pestaña
+**Admin** del launcher.
+
+| Rango | Qué puede hacer |
+|---|---|
+| **Owner** | Todo, incluido dar cualquier rango (también Owner). |
+| **Developer** | Crear, editar y borrar eventos y mods; whitelist; dar rangos hasta Staff. |
+| **Staff** | Añadir y quitar de la whitelist; dar Miembro o Invitado. Entra a todos los eventos. |
+| **Miembro** | Juega los eventos en cuya whitelist está. |
+| **Invitado** | Igual que Miembro. Es el rango por defecto. |
+
+- Nadie puede cambiar ni quitar de una whitelist a alguien con su rango o superior (salvo un Owner).
+- Las cuentas de `ADMIN_UUIDS` son **Owner fijos**: su rango no se cambia desde el panel.
+- Quien entra al panel web con la contraseña actúa como Owner.
+- El `whitelist.json` del servidor de Minecraft incluye la whitelist del evento
+  y al equipo (Staff, Developer y Owner), porque el equipo entra a todos los eventos.
+- Los rangos se guardan en `members/index.json` del almacenamiento.
+
+### Seguridad del panel
+
+- **Fuerza bruta:** 5 contraseñas incorrectas en 15 minutos bloquean esa IP
+  otros 15 minutos (responde `429`, incluso con la contraseña buena). Las IPs
+  no se guardan en claro, solo un HMAC. Usa una contraseña larga y aleatoria:
+  `openssl rand -base64 24`.
+- **Salir** cierra la sesión también en el servidor; el token deja de valer
+  aunque alguien lo haya copiado.
+- **Cerrar todas las sesiones** (botón del panel o `POST /api/admin/logout-all`)
+  invalida todas las sesiones web abiertas, por ejemplo si se pierde un portátil.
+- **Cambiar `ADMIN_PASSWORD`** (`npx wrangler secret put ADMIN_PASSWORD`)
+  invalida todas las sesiones web al momento.
+- Con Workers KV, la revocación puede tardar hasta un minuto en llegar a todas
+  las regiones de Cloudflare.
+- Cabeceras: CSP estricta (solo scripts propios y Trusted Types), sin iframes,
+  HSTS, `nosniff` y sin caché.
+- **Opcional:** el limitador de Cloudflare (`LOGIN_LIMITER` en `wrangler.toml`)
+  frena los intentos antes de tocar KV, así un ataque desde muchas IPs no gasta
+  las escrituras gratuitas de KV.
+
 ## Rutas
 
 | Ruta | Quién | Para qué |
@@ -61,6 +102,11 @@ en playerdb.co). La sesión web dura 12 horas y solo vale para administrar.
 | `GET /files/<sha1>` | cualquiera con el hash | un archivo de un pack |
 | `GET /admin` | navegador | panel web de administración |
 | `POST /api/admin/web-login` | navegador | `{ password }` → sesión web de admin |
+| `POST /api/admin/logout` | navegador | cierra la sesión web actual en el servidor |
+| `POST /api/admin/logout-all` | Owner | cierra todas las sesiones web |
+| `GET /api/admin/members` | Staff+ | cuentas con rango y rangos que puedes dar |
+| `PUT /api/admin/members/<uuid>` | Staff+ | `{ name, rank }` da un rango |
+| `DELETE /api/admin/members/<uuid>` | Staff+ | quita el rango (vuelve a Invitado) |
 | `GET /api/admin/resolve?q=<nombre o uuid>` | admin | busca la cuenta de Minecraft |
 | `GET /api/server/<EVT-…>/whitelist.json` | servidor de Minecraft (`SERVER_KEY`) | la whitelist en el formato de Minecraft |
 
@@ -95,6 +141,10 @@ curl -fsS -H "Authorization: Bearer $SERVER_KEY" \
   "https://obsidia-eventos.<cuenta>.workers.dev/api/server/EVT-XXXXXX/whitelist.json" \
   -o /ruta/al/servidor/whitelist.json && rcon-cli whitelist reload
 ```
+
+La clave va **solo** en la cabecera `Authorization`. Si se pasa en la URL
+(`?key=…`) el servidor responde `400`: en la URL acabaría en registros e
+historiales.
 
 ## Pruebas
 

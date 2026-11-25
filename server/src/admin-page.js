@@ -96,6 +96,15 @@ export const ADMIN_HTML = `<!doctype html>
   .src.dep { color: var(--accent-hover); }
   .search { margin-top: 12px; }
   .actions { align-items: center; }
+  .rank { font-size: 11px; font-weight: 650; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-strong); color: var(--muted); white-space: nowrap; flex: none; }
+  .rank.owner { color: #ffd479; border-color: #6b5520; background: #2a2210; }
+  .rank.developer { color: #7ec8ff; border-color: #24506e; background: #0f2130; }
+  .rank.staff { color: var(--accent-hover); border-color: #4a3a80; background: #1d1733; }
+  .rank.miembro { color: var(--ok); border-color: #245a3c; background: #0f2219; }
+  select.rank-select { width: auto; padding: 4px 8px; font-size: 12px; flex: none; }
+  .add select { width: auto; align-self: stretch; }
+  .item.ranks-item { border-color: var(--border); margin-bottom: 8px; }
+  .legend { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; align-items: center; margin: 0 0 16px; font-size: 13px; color: var(--muted); }
   .toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 10; max-width: calc(100vw - 32px); }
   .toast { padding: 10px 14px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--border-strong); white-space: pre-line; max-width: 420px; }
   .toast.err { border-color: #6b2b2b; color: var(--danger); }
@@ -129,10 +138,14 @@ export const ADMIN_HTML = `<!doctype html>
 <div id="app" hidden>
   <header class="top">
     <div><p class="eyebrow">Obsidia Eventos</p><h3>Panel de organizadores</h3></div>
-    <button class="btn sm" id="logout">Salir</button>
+    <div class="row">
+      <button class="btn sm danger" id="logout-all" title="Cierra el panel en todos los navegadores donde esté abierto">Cerrar todas las sesiones</button>
+      <button class="btn sm" id="logout">Salir</button>
+    </div>
   </header>
   <div class="layout">
     <aside>
+      <button class="item ranks-item" id="open-ranks"><strong>Rangos</strong><span>Owner, Developer, Staff, Miembro, Invitado</span></button>
       <div class="list-head">
         <p class="eyebrow">Eventos</p>
         <button class="btn sm primary" id="new-event">+ Nuevo</button>
@@ -144,6 +157,25 @@ export const ADMIN_HTML = `<!doctype html>
         <h2>Elige un evento</h2>
         <p class="hint">Crea eventos y decide quién entra. Solo las cuentas de la whitelist ven el evento en el launcher.</p>
       </div>
+
+      <section class="card" id="ranks" hidden>
+        <div class="card-head">
+          <div><p class="eyebrow">Equipo</p><h2>Rangos</h2></div>
+        </div>
+        <div class="legend">
+          <span class="rank owner">Owner</span><span>Todo, incluido dar cualquier rango.</span>
+          <span class="rank developer">Developer</span><span>Crear y editar eventos y mods, whitelist, dar rangos hasta Staff.</span>
+          <span class="rank staff">Staff</span><span>Whitelist y dar Miembro o Invitado. Entra a todos los eventos.</span>
+          <span class="rank miembro">Miembro</span><span>Juega los eventos en cuya whitelist está.</span>
+          <span class="rank">Invitado</span><span>Igual que Miembro. Es el rango de quien no tiene ninguno.</span>
+        </div>
+        <div class="add">
+          <textarea id="members-input" rows="2" placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"></textarea>
+          <select id="members-rank"></select>
+          <button class="btn primary" id="add-members" type="button">Dar rango</button>
+        </div>
+        <ul class="players" id="members"></ul>
+      </section>
 
       <div id="editor" hidden>
         <form class="card" id="event-form">
@@ -197,6 +229,7 @@ export const ADMIN_HTML = `<!doctype html>
           </div>
           <div class="add">
             <textarea id="players-input" rows="2" placeholder="Nombres de Minecraft o UUIDs, separados por comas o saltos de línea"></textarea>
+            <select id="players-rank" title="Rango que se les asigna al añadirlos"></select>
             <button class="btn primary" id="add-players" type="button">+ Añadir</button>
           </div>
           <p class="hint" style="margin-top:6px">Enter para añadir · Shift+Enter para otra línea.</p>
@@ -218,7 +251,99 @@ const TOKEN_KEY = "obsidia-eventos-admin";
 let token = null;
 try { token = sessionStorage.getItem(TOKEN_KEY); } catch {}
 let events = [];
-let openId = null; // null = nada, "new" = creando
+let openId = null; // null = nada, "new" = creando, "ranks" = rangos
+
+const RANKS = ["invitado", "miembro", "staff", "developer", "owner"];
+const RANK_NAMES = { invitado: "Invitado", miembro: "Miembro", staff: "Staff", developer: "Developer", owner: "Owner" };
+const level = (r) => RANKS.indexOf(r || "invitado");
+let members = [];
+let assignable = [];
+let me = { rank: "owner" };
+
+function rankBadge(rank) {
+  const s = document.createElement("span");
+  s.className = "rank " + (rank || "invitado");
+  s.textContent = RANK_NAMES[rank] || "Invitado";
+  return s;
+}
+
+/** ¿Puedo cambiar el rango de esta cuenta? (los owners fijos no se tocan) */
+function canChange(p) {
+  if (p.fixed || members.some((m) => m.fixed && m.uuid === p.uuid)) return false;
+  return me.rank === "owner" || level(p.rank) < level(me.rank);
+}
+
+/** Selector de rango para una cuenta, o solo su insignia si no se puede cambiar. */
+function rankControl(p) {
+  if (!canChange(p)) return rankBadge(p.rank);
+  const sel = document.createElement("select");
+  sel.className = "rank-select";
+  sel.title = "Cambiar rango";
+  for (const r of RANKS.slice().reverse()) {
+    if (!assignable.includes(r) && r !== (p.rank || "invitado")) continue;
+    const o = document.createElement("option");
+    o.value = r;
+    o.textContent = RANK_NAMES[r];
+    sel.appendChild(o);
+  }
+  sel.value = p.rank || "invitado";
+  sel.addEventListener("change", async () => {
+    sel.disabled = true;
+    try {
+      await setRank(p.uuid, p.name, sel.value);
+      toast(p.name + " ahora es " + RANK_NAMES[sel.value], "ok");
+    } catch (err) {
+      toast(err.message, "err");
+      sel.value = p.rank || "invitado";
+    } finally {
+      sel.disabled = false;
+    }
+  });
+  return sel;
+}
+
+async function setRank(uuid, name, rank) {
+  if (rank === "invitado") await api("DELETE", "/api/admin/members/" + uuid);
+  else await api("PUT", "/api/admin/members/" + uuid, { name, rank });
+  await refresh();
+}
+
+async function loadMembers() {
+  const r = await api("GET", "/api/admin/members");
+  members = r.members;
+  assignable = r.assignable;
+  me = r.me;
+  fillRankSelect($("players-rank"), true);
+  fillRankSelect($("members-rank"), false);
+}
+
+function fillRankSelect(sel, keepOption) {
+  const old = sel.value;
+  sel.replaceChildren();
+  if (keepOption) {
+    const o = document.createElement("option");
+    o.value = "";
+    o.textContent = "Sin cambiar rango";
+    sel.appendChild(o);
+  }
+  for (const r of RANKS.slice().reverse()) {
+    if (!assignable.includes(r)) continue;
+    const o = document.createElement("option");
+    o.value = r;
+    o.textContent = r === "invitado" && !keepOption ? "Invitado (quitar rango)" : RANK_NAMES[r];
+    sel.appendChild(o);
+  }
+  sel.value = old && [...sel.options].some((o) => o.value === old) ? old : assignable.includes("miembro") ? "miembro" : "";
+}
+
+/** Vuelve a pedir eventos y rangos sin perder lo que está abierto. */
+async function refresh() {
+  events = (await api("GET", "/api/admin/events")).events;
+  await loadMembers();
+  renderList();
+  if (openId === "ranks") renderMembers();
+  else renderPlayers();
+}
 
 function toast(msg, kind) {
   const el = document.createElement("div");
@@ -236,15 +361,20 @@ async function api(method, path, body) {
   });
   if (res.status === 204) return null;
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && path !== "/api/admin/web-login") { logout(); throw new Error("La sesión ha caducado; vuelve a entrar."); }
+  if (res.status === 401 && path !== "/api/admin/web-login") { logout(false); throw new Error(data.error || "La sesión ha caducado; vuelve a entrar."); }
   if (!res.ok) throw new Error(data.error || "Error " + res.status);
   return data;
 }
 
 function showLogin() { $("login").hidden = false; $("app").hidden = true; $("password").focus(); }
-function logout() {
+/** Borra la sesión del navegador; con remote = true también la invalida en el servidor. */
+function logout(remote) {
+  const old = token;
   token = null;
   try { sessionStorage.removeItem(TOKEN_KEY); } catch {}
+  if (remote && old) {
+    fetch("/api/admin/logout", { method: "POST", headers: { authorization: "Bearer " + old }, keepalive: true }).catch(() => {});
+  }
   showLogin();
 }
 
@@ -263,11 +393,22 @@ $("login-form").addEventListener("submit", async (e) => {
     $("login-btn").disabled = false;
   }
 });
-$("logout").addEventListener("click", logout);
+$("logout").addEventListener("click", () => logout(true));
+$("logout-all").addEventListener("click", async () => {
+  if (!confirm("¿Cerrar el panel en todos los navegadores? Tendrás que volver a entrar con la contraseña.")) return;
+  try {
+    await api("POST", "/api/admin/logout-all");
+    logout(false);
+    toast("Se cerraron todas las sesiones del panel", "ok");
+  } catch (err) {
+    toast(err.message, "err");
+  }
+});
 
 async function start() {
   try {
     events = (await api("GET", "/api/admin/events")).events;
+    await loadMembers();
   } catch (err) {
     if (token) toast(err.message, "err");
     return;
@@ -275,7 +416,7 @@ async function start() {
   $("login").hidden = true;
   $("app").hidden = false;
   renderList();
-  if (openId && openId !== "new" && !current()) openId = null;
+  if (openId && openId !== "new" && openId !== "ranks" && !current()) openId = null;
   renderEditor();
 }
 
@@ -363,6 +504,14 @@ form.name.addEventListener("input", () => { $("event-title").textContent = form.
 
 function renderEditor() {
   const ev = current();
+  $("open-ranks").classList.toggle("current", openId === "ranks");
+  $("ranks").hidden = openId !== "ranks";
+  if (openId === "ranks") {
+    $("empty").hidden = true;
+    $("editor").hidden = true;
+    renderMembers();
+    return;
+  }
   $("empty").hidden = openId !== null;
   $("editor").hidden = openId === null;
   if (openId === null) return;
@@ -726,6 +875,7 @@ function renderPlayers() {
     const n = document.createElement("span"); n.className = "p-name"; n.textContent = p.name;
     const u = document.createElement("span"); u.className = "p-uuid mono"; u.textContent = p.uuid;
     const x = document.createElement("button"); x.className = "x"; x.title = "Quitar de la whitelist"; x.textContent = "✕";
+    x.disabled = me.rank !== "owner" && level(p.rank) >= level(me.rank);
     x.addEventListener("click", async () => {
       try {
         ev.players = (await api("DELETE", "/api/admin/events/" + ev.id + "/players/" + p.uuid)).players;
@@ -733,30 +883,99 @@ function renderPlayers() {
         renderList();
       } catch (err) { toast(err.message, "err"); }
     });
-    li.append(n, u, x);
+    li.append(n, rankControl(p), u, x);
     list.appendChild(li);
   }
 }
-$("filter").addEventListener("input", renderPlayers);
 
-async function addPlayers() {
-  const ev = current();
-  if (!ev) return;
-  const queries = $("players-input").value.split(/[\\s,;]+/).map((q) => q.trim()).filter(Boolean);
-  if (queries.length === 0) return;
-  const btn = $("add-players");
-  btn.disabled = true;
-  btn.textContent = "Buscando…";
+function renderMembers() {
+  const list = $("members");
+  list.replaceChildren();
+  const shown = members.filter((m) => m.rank !== "invitado");
+  if (shown.length === 0) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "Nadie tiene rango todavía. Todos son Invitado.";
+    list.appendChild(li);
+  }
+  for (const m of shown) {
+    const li = document.createElement("li");
+    const n = document.createElement("span"); n.className = "p-name"; n.textContent = m.name || "(sin nombre)";
+    const u = document.createElement("span"); u.className = "p-uuid mono";
+    u.textContent = m.fixed ? m.uuid + " · Owner fijo (ADMIN_UUIDS)" : m.uuid;
+    li.append(n, rankControl(m), u);
+    if (canChange(m)) {
+      const x = document.createElement("button"); x.className = "x"; x.title = "Quitar rango (pasa a Invitado)"; x.textContent = "✕";
+      x.addEventListener("click", async () => {
+        try { await setRank(m.uuid, m.name, "invitado"); toast(m.name + " vuelve a ser Invitado", "ok"); }
+        catch (err) { toast(err.message, "err"); }
+      });
+      li.appendChild(x);
+    }
+    list.appendChild(li);
+  }
+}
+
+async function resolveAll(text) {
+  const queries = text.split(/[\\s,;]+/).map((q) => q.trim()).filter(Boolean);
   const found = [];
   const failed = [];
   for (const q of queries) {
     try { found.push(await api("GET", "/api/admin/resolve?q=" + encodeURIComponent(q))); }
     catch (err) { failed.push({ q, msg: err.message }); }
   }
+  return { queries, found, failed };
+}
+
+async function addMembers() {
+  const rank = $("members-rank").value;
+  const btn = $("add-members");
+  btn.disabled = true;
+  btn.textContent = "Buscando…";
+  try {
+    const { found, failed } = await resolveAll($("members-input").value);
+    const errors = failed.map((f) => f.q + ": " + f.msg);
+    let ok = 0;
+    for (const p of found) {
+      try {
+        if (rank === "invitado") await api("DELETE", "/api/admin/members/" + p.uuid);
+        else await api("PUT", "/api/admin/members/" + p.uuid, { name: p.name, rank });
+        ok++;
+      } catch (err) { errors.push(p.name + ": " + err.message); }
+    }
+    if (ok) toast(ok + " cuenta(s) ahora con rango " + RANK_NAMES[rank], "ok");
+    if (errors.length) toast(errors.join("\\n"), "err");
+    $("members-input").value = failed.map((f) => f.q).join("\\n");
+    await refresh();
+  } catch (err) {
+    toast(err.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Dar rango";
+  }
+}
+$("add-members").addEventListener("click", addMembers);
+$("members-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); addMembers(); }
+});
+$("open-ranks").addEventListener("click", () => { openId = "ranks"; renderList(); renderEditor(); });
+$("filter").addEventListener("input", renderPlayers);
+
+async function addPlayers() {
+  const ev = current();
+  if (!ev) return;
+  if (!$("players-input").value.trim()) return;
+  const rank = $("players-rank").value || null;
+  const btn = $("add-players");
+  btn.disabled = true;
+  btn.textContent = "Buscando…";
+  const { found, failed } = await resolveAll($("players-input").value);
   try {
     if (found.length) {
-      ev.players = (await api("POST", "/api/admin/events/" + ev.id + "/players", { players: found })).players;
-      toast(found.length + " jugador(es) añadidos a la whitelist", "ok");
+      const players = found.map((p) => (rank ? { ...p, rank } : p));
+      ev.players = (await api("POST", "/api/admin/events/" + ev.id + "/players", { players })).players;
+      toast(found.length + " jugador(es) añadidos a la whitelist" + (rank ? " como " + RANK_NAMES[rank] : ""), "ok");
+      if (rank) await loadMembers();
     }
     $("players-input").value = failed.map((f) => f.q).join("\\n");
     if (failed.length) toast("No se encontraron:\\n" + failed.map((f) => f.q + ": " + f.msg).join("\\n"), "err");
