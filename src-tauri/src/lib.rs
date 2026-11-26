@@ -1133,6 +1133,20 @@ fn get_instance_background(state: State<'_, AppState>, instance_id: String) -> C
     }))
 }
 
+/// Imagen de un evento para la pantalla de inicio (se descarga sin esperar a jugar).
+#[tauri::command]
+async fn get_event_image(
+    state: State<'_, AppState>,
+    event_id: String,
+    image_url: Option<String>,
+) -> CmdResult<Option<BackgroundView>> {
+    let image = events::event_image(&state.paths, &event_id, image_url.as_deref()).await?;
+    Ok(image.map(|(mime, bytes)| BackgroundView {
+        mime,
+        data_base64: BASE64.encode(bytes),
+    }))
+}
+
 // ───────────────────────────── Fondo e icono del launcher ─────────────────────────────
 
 #[tauri::command]
@@ -1862,6 +1876,7 @@ pub fn run() {
             list_instances,
             open_instance_folder,
             get_instance_background,
+            get_event_image,
             get_launcher_background,
             set_launcher_background,
             clear_launcher_background,

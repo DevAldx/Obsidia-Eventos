@@ -16,18 +16,28 @@
     events.find((e) => e.id === selectedId) ?? events[0] ?? null,
   );
   const local = $derived(event ? app.list.instances.find((i) => i.id === event.id) : undefined);
-  const bg = $derived(event ? app.backgrounds[event.id] : undefined);
+  const bg = $derived(event ? app.eventBackground(event.id) : undefined);
   const modCount = $derived(event?.manifest?.mods.length ?? 0);
 
+  // La imagen de cada evento se descarga en cuanto aparece (y otra vez si cambia).
   $effect(() => {
-    for (const e of events) void app.ensureBackground(e.id);
-  });
-  // Tras jugar por primera vez se descarga la imagen del evento.
-  $effect(() => {
-    if (event && local && bg === null) {
-      app.invalidateBackground(event.id);
-      void app.ensureBackground(event.id);
+    for (const e of events) {
+      void app.ensureBackground(e.id);
+      void app.ensureEventImage(e);
     }
+  });
+
+  // Al volver al launcher (p. ej. tras editar el evento en la web) se piden de
+  // nuevo los eventos, como mucho una vez cada 30 s.
+  $effect(() => {
+    let last = Date.now();
+    const onFocus = () => {
+      if (Date.now() - last < 30_000 || app.eventsLoading) return;
+      last = Date.now();
+      void app.loadEvents();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   });
 
   const loaderText = (e: EventInfo) =>
@@ -196,7 +206,7 @@
         <aside class="rail">
           <p class="rail-title">Tus eventos</p>
           {#each events as e (e.id)}
-            {@const ebg = app.backgrounds[e.id]}
+            {@const ebg = app.eventBackground(e.id)}
             <button class="rail-item" class:current={e.id === event.id} onclick={() => (selectedId = e.id)}>
               <span class="thumb" class:obsidia-bg={!ebg} style:background-image={ebg ? `url(${ebg})` : undefined}></span>
               <span class="rail-text">

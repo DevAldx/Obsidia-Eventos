@@ -56,6 +56,8 @@ export const api = {
   openHttpsUrl: (url: string) => call<void>("open_https_url", { url }),
   checkForUpdates: () => call<UpdateCheck>("check_for_updates"),
   getInstanceBackground: (instanceId: string) => call<BackgroundView | null>("get_instance_background", { instanceId }),
+  getEventImage: (eventId: string, imageUrl: string | null) =>
+    call<BackgroundView | null>("get_event_image", { eventId, imageUrl }),
   getLauncherBackground: () => call<BackgroundView | null>("get_launcher_background"),
   setLauncherBackground: (mime: string, dataBase64: string) =>
     call<void>("set_launcher_background", { mime, dataBase64 }),

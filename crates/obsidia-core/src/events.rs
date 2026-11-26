@@ -484,19 +484,59 @@ fn remove_foreign_mods(mods_dir: &Path, allowed: &HashSet<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Descarga la imagen de un evento (solo https, hasta 15 MB).
+async fn download_image(url: &str) -> Result<Vec<u8>> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| CoreError::invalid("la URL de la imagen no es válida"))?;
+    if parsed.scheme() != "https" {
+        return Err(CoreError::invalid("la imagen del evento debe ser https"));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| CoreError::invalid("la URL de la imagen no tiene servidor"))?
+        .to_owned();
+    Downloader::new(&[host.as_str()])?
+        .fetch_bytes(url, share::MAX_BACKGROUND_BYTES)
+        .await
+}
+
+/// Imagen de un evento para la pantalla de inicio, sin esperar a jugar.
+///
+/// Se guarda en `<datos>/event-images/<EVT-…>.<ext>` junto a un `.url` con la
+/// dirección de la que salió: solo se vuelve a descargar si el evento la cambia.
+/// Sin `url` (el evento ya no tiene imagen) se borra la copia.
+pub async fn event_image(paths: &ObsidiaPaths, id: &str, url: Option<&str>) -> Result<Option<(String, Vec<u8>)>> {
+    let id = event_id(id)?;
+    let stem = id.as_str();
+    let dir = paths.data_dir().join("event-images");
+    let marker = dir.join(format!("{stem}.url"));
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        if dir.exists() {
+            background::clear_named(&dir, stem)?;
+        }
+        let _ = std::fs::remove_file(&marker);
+        return Ok(None);
+    };
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(url) {
+        if let Some(cached) = background::load_named(&dir, stem)? {
+            return Ok(Some(cached));
+        }
+    }
+    let bytes = download_image(url).await?;
+    let mime = background::sniff_mime(&bytes)
+        .ok_or_else(|| CoreError::invalid("la imagen del evento no es PNG, JPG, WEBP ni GIF"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
+    background::save_named(&dir, stem, mime, &bytes)?;
+    std::fs::write(&marker, url).map_err(|e| CoreError::io(&marker, e))?;
+    Ok(Some((mime.to_owned(), bytes)))
+}
+
 /// Descarga la imagen del evento si cambió. Un fallo no impide jugar.
 async fn sync_image(dir: &Path, event: &EventInfo) {
     let marker = dir.join(IMAGE_MARKER);
     let current = std::fs::read_to_string(&marker).ok();
     match &event.image_url {
         Some(url) if current.as_deref() != Some(url.as_str()) => {
-            let Ok(parsed) = reqwest::Url::parse(url) else { return };
-            let Some(host) = parsed.host_str().map(str::to_owned) else { return };
-            if parsed.scheme() != "https" {
-                return;
-            }
-            let Ok(dl) = Downloader::new(&[host.as_str()]) else { return };
-            if let Ok(bytes) = dl.fetch_bytes(url, share::MAX_BACKGROUND_BYTES).await {
+            if let Ok(bytes) = download_image(url).await {
                 if background::save_detected(dir, &bytes).is_ok() {
                     let _ = std::fs::write(&marker, url);
                 }
@@ -542,6 +582,32 @@ mod tests {
         // El rango del jugador solo se envía si se quiere cambiar.
         let p = Player { uuid: "u".into(), name: "n".into(), added: None, rank: None };
         assert!(!serde_json::to_string(&p).unwrap().contains("rank"));
+    }
+
+    #[tokio::test]
+    async fn event_image_is_cached_by_url() {
+        let tmp = std::env::temp_dir().join(format!("obsidia-ev-img-{}", std::process::id()));
+        let paths = ObsidiaPaths::new(tmp.join("config"), tmp.join("data"));
+        let dir = tmp.join("data").join("event-images");
+        let png: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+        let url = "https://eventos.example/files/abc";
+        std::fs::create_dir_all(&dir).unwrap();
+        background::save_named(&dir, "EVT-ABC123", "image/png", png).unwrap();
+        std::fs::write(dir.join("EVT-ABC123.url"), url).unwrap();
+
+        // Misma URL: sale de la caché, sin tocar la red.
+        let (mime, bytes) = event_image(&paths, "EVT-ABC123", Some(url)).await.unwrap().unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(bytes, png);
+        // Otra URL que no es https: no se descarga nada.
+        assert!(event_image(&paths, "EVT-ABC123", Some("http://eventos.example/x")).await.is_err());
+        // Un id que no es de evento no puede escribir fuera de la carpeta.
+        assert!(event_image(&paths, "../EVT-AB", Some(url)).await.is_err());
+        // Sin imagen: se borra la copia.
+        assert!(event_image(&paths, "EVT-ABC123", None).await.unwrap().is_none());
+        assert!(background::load_named(&dir, "EVT-ABC123").unwrap().is_none());
+        assert!(!dir.join("EVT-ABC123.url").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

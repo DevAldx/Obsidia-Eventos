@@ -65,6 +65,35 @@ class AppState {
     delete this.backgrounds[instanceId];
   }
 
+  /**
+   * Imagen de cada evento, descargada sin esperar a jugar: la URL de la que
+   * salió y su `data:` URL (`null` = sin imagen o no se pudo descargar).
+   */
+  eventImages = $state<Record<string, { url: string | null; data: string | null }>>({});
+  private eventImagesLoading = new Set<string>();
+
+  /** Descarga (o lee de la caché) la imagen de un evento si su URL cambió. */
+  async ensureEventImage(event: { id: string; image_url: string | null }) {
+    const url = event.image_url ?? null;
+    const key = `${event.id}\n${url ?? ""}`;
+    if (this.eventImages[event.id]?.url === url || this.eventImagesLoading.has(key)) return;
+    this.eventImagesLoading.add(key);
+    try {
+      const img = await api.getEventImage(event.id, url);
+      this.eventImages[event.id] = { url, data: img ? `data:${img.mime};base64,${img.data_base64}` : null };
+    } catch {
+      this.eventImages[event.id] = { url, data: null };
+    } finally {
+      this.eventImagesLoading.delete(key);
+    }
+  }
+
+  /** Fondo de un evento: su imagen; mientras carga, la que tenga la instancia. */
+  eventBackground(id: string): string | null | undefined {
+    const img = this.eventImages[id];
+    return img ? img.data : this.backgrounds[id];
+  }
+
   async loadLauncherAppearance() {
     try {
       const [background, icon] = await Promise.all([
