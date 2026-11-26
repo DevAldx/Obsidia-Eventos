@@ -177,25 +177,70 @@ pub fn mojang_arch() -> &'static str {
     }
 }
 
-fn os_matches(os: &OsRule) -> bool {
-    if os.name.as_deref().is_some_and(|n| n != "linux") {
+/// Sistema operativo con el nombre que usa Mojang en sus reglas.
+pub fn mojang_os() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "osx"
+    } else {
+        "linux"
+    }
+}
+
+/// Sistema y arquitectura para los que se eligen libraries, natives y argumentos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Platform {
+    /// `linux`, `windows` u `osx`.
+    pub os: &'static str,
+    /// `x86_64`, `arm64` o `x86`.
+    pub arch: &'static str,
+}
+
+impl Platform {
+    /// El equipo en el que corre el launcher.
+    pub fn current() -> Self {
+        Self {
+            os: mojang_os(),
+            arch: mojang_arch(),
+        }
+    }
+
+    /// `${arch}` de los clasificadores de natives antiguos (`natives-windows-${arch}`).
+    fn bits(self) -> &'static str {
+        if self.arch == "x86" {
+            "32"
+        } else {
+            "64"
+        }
+    }
+}
+
+fn os_matches(os: &OsRule, platform: Platform) -> bool {
+    if os.name.as_deref().is_some_and(|n| n != platform.os) {
         return false;
     }
-    if os.arch.as_deref().is_some_and(|a| a != mojang_arch()) {
+    if os.arch.as_deref().is_some_and(|a| a != platform.arch) {
         return false;
     }
-    // Las restricciones por versión de SO solo existen para Windows/macOS.
+    // Las reglas por versión de SO solo añaden ajustes (p. ej. `-Dos.name=Windows 10`)
+    // que no hacen falta: no se aplican.
     os.version.is_none()
 }
 
-/// Evalúa una lista de reglas. Vacía = permitido; si no, gana la última que coincida.
+/// Evalúa una lista de reglas en este equipo. Vacía = permitido; si no, gana la última que coincida.
 pub fn rules_allow(rules: &[Rule], features: &HashSet<&str>) -> bool {
+    rules_allow_on(rules, features, Platform::current())
+}
+
+/// Como [`rules_allow`], para una plataforma concreta.
+pub fn rules_allow_on(rules: &[Rule], features: &HashSet<&str>, platform: Platform) -> bool {
     if rules.is_empty() {
         return true;
     }
     let mut allowed = false;
     for rule in rules {
-        let os_ok = rule.os.as_ref().is_none_or(os_matches);
+        let os_ok = rule.os.as_ref().is_none_or(|os| os_matches(os, platform));
         let feat_ok = rule.features.as_ref().is_none_or(|f| {
             f.iter()
                 .all(|(name, want)| features.contains(name.as_str()) == *want)
@@ -241,7 +286,7 @@ pub struct LibFile {
     pub size: Option<u64>,
 }
 
-/// Library ya filtrada por reglas para Linux.
+/// Library ya filtrada por las reglas de la plataforma.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLib {
     pub name: String,
@@ -286,23 +331,32 @@ fn file_from(remote: &RemoteFile, fallback_path: impl FnOnce() -> Result<String>
     })
 }
 
-/// Libraries aplicables a Linux, sin duplicados por ruta.
+/// Libraries aplicables a este equipo, sin duplicados por ruta.
 pub fn resolve_libraries(meta: &VersionMeta, features: &HashSet<&str>) -> Result<Vec<ResolvedLib>> {
+    resolve_libraries_on(meta, features, Platform::current())
+}
+
+/// Como [`resolve_libraries`], para una plataforma concreta.
+pub fn resolve_libraries_on(
+    meta: &VersionMeta,
+    features: &HashSet<&str>,
+    platform: Platform,
+) -> Result<Vec<ResolvedLib>> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
 
     for lib in &meta.libraries {
-        if !rules_allow(&lib.rules, features) {
+        if !rules_allow_on(&lib.rules, features, platform) {
             continue;
         }
         let downloads = lib.downloads.as_ref();
         let mut artifact = None;
         let mut native = None;
 
-        // Clasificador de natives antiguo (≤ 1.18): `natives: { linux: "natives-linux" }`.
+        // Clasificador de natives antiguo (≤ 1.18): `natives: { windows: "natives-windows" }`.
         if let Some(natives) = &lib.natives {
-            if let Some(classifier) = natives.get("linux") {
-                let classifier = classifier.replace("${arch}", "64");
+            if let Some(classifier) = natives.get(platform.os) {
+                let classifier = classifier.replace("${arch}", platform.bits());
                 let remote = downloads
                     .and_then(|d| d.classifiers.as_ref())
                     .and_then(|c| c.get(&classifier))
@@ -318,7 +372,7 @@ pub fn resolve_libraries(meta: &VersionMeta, features: &HashSet<&str>) -> Result
             }
         } else if let Some(remote) = downloads.and_then(|d| d.artifact.as_ref()) {
             let file = file_from(remote, || maven_path(&lib.name))?;
-            // Estilo nuevo: la library de natives es un artefacto más (`…:natives-linux`).
+            // Estilo nuevo: la library de natives es un artefacto más (`…:natives-windows`).
             if lib.name.split(':').nth(3).is_some_and(|c| c.starts_with("natives-")) {
                 native = Some(file.clone());
             }
@@ -370,7 +424,10 @@ pub(crate) mod fixtures {
         {"name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.4-nightly-20150209",
          "natives": {"linux": "natives-linux", "windows": "natives-windows", "osx": "natives-osx"},
          "extract": {"exclude": ["META-INF/"]},
-         "downloads": {"classifiers": {"natives-linux": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-linux.jar", "sha1": "dd", "size": 7, "url": "https://libraries.minecraft.net/x-linux.jar"}}}},
+         "downloads": {"classifiers": {
+           "natives-linux": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-linux.jar", "sha1": "dd", "size": 7, "url": "https://libraries.minecraft.net/x-linux.jar"},
+           "natives-windows": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-windows.jar", "sha1": "de", "size": 7, "url": "https://libraries.minecraft.net/x-windows.jar"},
+           "natives-osx": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.4-nightly-20150209/lwjgl-platform-2.9.4-nightly-20150209-natives-osx.jar", "sha1": "df", "size": 7, "url": "https://libraries.minecraft.net/x-osx.jar"}}}},
         {"name": "net.java.jinput:jinput-platform:2.0.5",
          "natives": {"windows": "natives-windows"},
          "downloads": {"classifiers": {"natives-windows": {"path": "w.jar", "sha1": "ee", "size": 1, "url": "https://libraries.minecraft.net/w.jar"}}}},
@@ -436,34 +493,47 @@ mod tests {
         names.iter().copied().collect()
     }
 
+    const LINUX: Platform = Platform { os: "linux", arch: "x86_64" };
+    const WINDOWS: Platform = Platform { os: "windows", arch: "x86_64" };
+
+    fn rules(json: &str) -> Vec<Rule> {
+        serde_json::from_str(json).expect("rules")
+    }
+
     #[test]
     fn rules_semantics() {
-        let allow_osx: Vec<Rule> = serde_json::from_str(
-            r#"[{"action":"allow","os":{"name":"osx"}}]"#,
-        )
-        .expect("rules");
-        assert!(!rules_allow(&allow_osx, &feats(&[])));
-        assert!(rules_allow(&[], &feats(&[])));
+        let none = feats(&[]);
+        let allow_osx = rules(r#"[{"action":"allow","os":{"name":"osx"}}]"#);
+        assert!(!rules_allow_on(&allow_osx, &none, LINUX));
+        assert!(!rules_allow_on(&allow_osx, &none, WINDOWS));
+        assert!(rules_allow_on(&[], &none, LINUX));
 
         // "allow todo, salvo osx"
-        let except_osx: Vec<Rule> = serde_json::from_str(
-            r#"[{"action":"allow"},{"action":"disallow","os":{"name":"osx"}}]"#,
-        )
-        .expect("rules");
-        assert!(rules_allow(&except_osx, &feats(&[])));
+        let except_osx = rules(r#"[{"action":"allow"},{"action":"disallow","os":{"name":"osx"}}]"#);
+        assert!(rules_allow_on(&except_osx, &none, LINUX));
+        assert!(rules_allow_on(&except_osx, &none, WINDOWS));
 
-        let win10: Vec<Rule> = serde_json::from_str(
-            r#"[{"action":"allow","os":{"name":"linux","version":"^10\\."}}]"#,
-        )
-        .expect("rules");
-        assert!(!rules_allow(&win10, &feats(&[])));
+        let only_windows = rules(r#"[{"action":"allow","os":{"name":"windows"}}]"#);
+        assert!(rules_allow_on(&only_windows, &none, WINDOWS));
+        assert!(!rules_allow_on(&only_windows, &none, LINUX));
 
-        let demo: Vec<Rule> = serde_json::from_str(
-            r#"[{"action":"allow","features":{"is_demo_user":true}}]"#,
-        )
-        .expect("rules");
-        assert!(!rules_allow(&demo, &feats(&[])));
-        assert!(rules_allow(&demo, &feats(&["is_demo_user"])));
+        // natives-windows-x86 es solo para Windows de 32 bits.
+        let windows_x86 = rules(r#"[{"action":"allow","os":{"name":"windows","arch":"x86"}}]"#);
+        assert!(!rules_allow_on(&windows_x86, &none, WINDOWS));
+
+        // Las reglas por versión de SO no se aplican.
+        let win10 = rules(r#"[{"action":"allow","os":{"name":"windows","version":"^10\\."}}]"#);
+        assert!(!rules_allow_on(&win10, &none, WINDOWS));
+
+        let demo = rules(r#"[{"action":"allow","features":{"is_demo_user":true}}]"#);
+        assert!(!rules_allow_on(&demo, &none, LINUX));
+        assert!(rules_allow_on(&demo, &feats(&["is_demo_user"]), LINUX));
+    }
+
+    #[test]
+    fn current_platform_is_this_machine() {
+        let p = Platform::current();
+        assert_eq!(p.os, if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "osx" } else { "linux" });
     }
 
     #[test]
@@ -481,7 +551,7 @@ mod tests {
 
     #[test]
     fn legacy_libraries_resolve_for_linux() {
-        let libs = resolve_libraries(&parse(LEGACY), &feats(&[])).expect("resolve");
+        let libs = resolve_libraries_on(&parse(LEGACY), &feats(&[]), LINUX).expect("resolve");
         let names: Vec<_> = libs.iter().map(|l| l.name.as_str()).collect();
         // jinput solo tiene natives de Windows y oshi es de macOS: ambas fuera.
         assert_eq!(
@@ -501,18 +571,47 @@ mod tests {
     }
 
     #[test]
-    fn modern_libraries_dedup_and_natives() {
-        let libs = resolve_libraries(&parse(MODERN), &feats(&[])).expect("resolve");
-        let paths: Vec<_> = libs
-            .iter()
-            .filter_map(|l| l.artifact.as_ref().map(|a| a.rel_path.as_str()))
-            .collect();
-        // lwjgl base (duplicada, una sola vez) + natives-linux. Ni windows ni arm64 (en x86_64).
-        let expected_arm = mojang_arch() == "arm64";
-        assert_eq!(paths.len(), if expected_arm { 3 } else { 2 });
-        assert!(paths.contains(&"org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-linux.jar"));
+    fn legacy_libraries_resolve_for_windows() {
+        let libs = resolve_libraries_on(&parse(LEGACY), &feats(&[]), WINDOWS).expect("resolve");
+        let names: Vec<_> = libs.iter().map(|l| l.name.as_str()).collect();
+        // En Windows sí entra jinput (solo tiene natives de Windows); oshi sigue fuera.
+        assert_eq!(
+            names,
+            [
+                "com.google.code.gson:gson:2.2.4",
+                "org.lwjgl.lwjgl:lwjgl-platform:2.9.4-nightly-20150209",
+                "net.java.jinput:jinput-platform:2.0.5",
+                "old.group:oldlib:1.0"
+            ]
+        );
+        assert!(libs[1].native.as_ref().is_some_and(|n| n.rel_path.ends_with("natives-windows.jar")));
+        assert!(libs[2].native.as_ref().is_some_and(|n| n.rel_path == "w.jar"));
+    }
+
+    fn modern_paths(platform: Platform) -> Vec<String> {
+        let libs = resolve_libraries_on(&parse(MODERN), &feats(&[]), platform).expect("resolve");
         let natives = libs.iter().filter(|l| l.native.is_some()).count();
-        assert_eq!(natives, paths.len() - 1);
+        let paths: Vec<String> = libs
+            .iter()
+            .filter_map(|l| l.artifact.as_ref().map(|a| a.rel_path.clone()))
+            .collect();
+        assert_eq!(natives, paths.len() - 1, "todo menos lwjgl base son natives");
+        paths
+    }
+
+    #[test]
+    fn modern_libraries_dedup_and_natives() {
+        // lwjgl base (duplicada, una sola vez) + los natives del sistema, nunca los de otro.
+        assert_eq!(
+            modern_paths(LINUX),
+            ["org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar", "org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-linux.jar"]
+        );
+        assert_eq!(
+            modern_paths(WINDOWS),
+            ["org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar", "org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3-natives-windows.jar"]
+        );
+        let linux_arm = modern_paths(Platform { os: "linux", arch: "arm64" });
+        assert!(linux_arm.iter().any(|p| p.ends_with("natives-linux-arm64.jar")));
     }
 
     #[test]
