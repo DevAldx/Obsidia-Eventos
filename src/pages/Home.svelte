@@ -152,7 +152,15 @@
     </section>
   {:else if event}
     <!-- ───────────── Evento seleccionado ───────────── -->
-    <section class="stage" class:obsidia-bg={!bg} style:background-image={bg ? `url(${bg})` : undefined}>
+    <section class="stage" class:obsidia-bg={!bg}>
+      {#if bg}
+        <!-- Capa propia: así la imagen no se pinta bajo el borde y se puede atenuar. -->
+        <div
+          class="stage-bg"
+          style:background-image={`url(${bg})`}
+          style:opacity={(app.settings?.ui.event_image_opacity ?? 100) / 100}
+        ></div>
+      {/if}
       <div class="shade"></div>
       <div class="stage-main">
         <div class="tags">
@@ -317,9 +325,15 @@
     min-height: clamp(380px, 66vh, 620px);
     border-radius: var(--radius-lg);
     border: 1px solid var(--border);
+    background-color: var(--background);
+    overflow: hidden;
+  }
+  .stage-bg {
+    position: absolute;
+    inset: 0;
     background-size: cover;
     background-position: center;
-    overflow: hidden;
+    pointer-events: none;
   }
   .shade {
     position: absolute;

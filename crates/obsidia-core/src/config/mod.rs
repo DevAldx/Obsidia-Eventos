@@ -49,6 +49,8 @@ pub struct UiSettings {
     pub background_blur: u8,
     /// Oscurecimiento del fondo del launcher, en porcentaje (0-90).
     pub background_dim: u8,
+    /// Opacidad de la imagen de los eventos en la pantalla de inicio, en porcentaje (10-100).
+    pub event_image_opacity: u8,
 }
 
 impl Default for UiSettings {
@@ -61,6 +63,7 @@ impl Default for UiSettings {
             background_fit: BackgroundFit::Cover,
             background_blur: 0,
             background_dim: 40,
+            event_image_opacity: 100,
         }
     }
 }
@@ -82,6 +85,11 @@ impl UiSettings {
         }
         if self.background_dim > 90 {
             return Err(CoreError::invalid("el oscurecimiento del fondo debe estar entre 0 y 90"));
+        }
+        if !(10..=100).contains(&self.event_image_opacity) {
+            return Err(CoreError::invalid(
+                "la opacidad de la imagen de los eventos debe estar entre 10 y 100",
+            ));
         }
         Ok(())
     }
@@ -296,6 +304,7 @@ mod tests {
         s.ui.background_fit = BackgroundFit::Tile;
         s.ui.background_blur = 12;
         s.ui.background_dim = 60;
+        s.ui.event_image_opacity = 55;
         s.minecraft.max_ram_mb = 4096;
         assert!(s.save(&path).is_ok());
         assert_eq!(Settings::load(&path).unwrap_or_default(), s);
@@ -318,6 +327,13 @@ mod tests {
         s.ui.background_blur = 0;
         s.ui.background_dim = 91;
         assert!(s.validate().is_err());
+        s.ui.background_dim = 40;
+        s.ui.event_image_opacity = 9;
+        assert!(s.validate().is_err());
+        s.ui.event_image_opacity = 101;
+        assert!(s.validate().is_err());
+        s.ui.event_image_opacity = 10;
+        assert!(s.validate().is_ok());
     }
 
     #[test]
@@ -334,6 +350,7 @@ mod tests {
         assert_eq!(s.ui.background_fit, BackgroundFit::Cover);
         assert_eq!(s.ui.background_blur, 0);
         assert_eq!(s.ui.background_dim, 40);
+        assert_eq!(s.ui.event_image_opacity, 100);
     }
 
     #[test]
