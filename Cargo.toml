@@ -6,7 +6,7 @@ members = ["crates/*"]
 exclude = ["src-tauri"]
 
 [workspace.package]
-version = "0.2.2-dev"
+version = "0.2.3-dev"
 edition = "2021"
 license = "MIT"
 
