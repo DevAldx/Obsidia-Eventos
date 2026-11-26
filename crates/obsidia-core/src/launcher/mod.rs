@@ -298,7 +298,7 @@ pub async fn run_game(
     log_file: Option<PathBuf>,
     kill: oneshot::Receiver<()>,
 ) -> Result<Option<i32>> {
-    let mut child = Command::new(&cmd.program)
+    let mut child = crate::java::hide_console(&mut Command::new(&cmd.program))
         .args(&cmd.args)
         .current_dir(&cmd.cwd)
         .stdin(std::process::Stdio::null())

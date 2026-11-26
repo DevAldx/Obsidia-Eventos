@@ -107,9 +107,20 @@ fn candidate_paths(paths: &ObsidiaPaths) -> Vec<PathBuf> {
     out
 }
 
+/// En Windows, `java.exe` lanzado desde una app con ventana abre además una
+/// consola negra. La salida se lee por las tuberías, así que no hace falta.
+pub(crate) fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 async fn probe(path: PathBuf) -> Option<JavaRuntime> {
     let mut cmd = Command::new(&path);
-    cmd.arg("-version").kill_on_drop(true);
+    hide_console(&mut cmd).arg("-version").kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
         .ok()?
