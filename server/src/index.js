@@ -25,6 +25,10 @@ import { ADMIN_HTML, ADMIN_JS } from "./admin-page.js";
 //   PUT    /api/admin/members/<uuid>              { name, rank } dar un rango                (Staff+)
 //   DELETE /api/admin/members/<uuid>              quitar el rango (vuelve a Invitado)        (Staff+)
 //   PUT    /api/files/<sha1>, POST /api/packs     subir el pack del evento                   (Developer+)
+//   POST   /api/files/<sha1>/multipart            { size } empezar a subir un archivo grande  (Developer+)
+//   PUT    /api/files/<sha1>/multipart/<n>        la parte n (part_size bytes; la última, el resto)
+//   POST   /api/files/<sha1>/multipart/complete   { parts: [{ part_number, etag }] }
+//   DELETE /api/files/<sha1>/multipart            cancelar la subida
 //   DELETE /api/packs/<code>                                                                  (Developer+)
 //
 // Panel web (contraseña ADMIN_PASSWORD):
@@ -105,6 +109,7 @@ export default {
   async fetch(request, env) {
     try {
       // R2 si está configurado (pide tarjeta, aunque sea gratis); si no, Workers KV.
+      // Con FILES (KV) y BLOBS (R2), los archivos subidos van a R2 y lo demás a KV.
       if (!env.BUCKET && env.FILES) env = { ...env, BUCKET: kvBucket(env.FILES), USING_KV: true };
       if (!env.BUCKET) throw new HttpError(500, "falta configurar el almacenamiento (FILES o BUCKET en wrangler.toml)");
       return await route(request, env);
@@ -175,7 +180,8 @@ function kvBucket(kv) {
     async put(key, value, opts = {}) {
       const bytes = typeof value === "string" ? enc.encode(value) : new Uint8Array(value);
       await kv.put(key, bytes, {
-        metadata: { size: bytes.byteLength, custom: opts.customMetadata ?? {} },
+        // `size` permite que un archivo en trozos diga lo que mide entero.
+        metadata: { size: opts.size ?? bytes.byteLength, custom: opts.customMetadata ?? {} },
         // KV borra solo las claves temporales (mínimo 60 s). R2 lo ignora.
         ...(opts.expirationTtl ? { expirationTtl: Math.max(60, Math.ceil(opts.expirationTtl)) } : {}),
       });
@@ -183,14 +189,53 @@ function kvBucket(kv) {
     async delete(key) {
       await kv.delete(key);
     },
+    /** Claves con un prefijo y su metadata, sin leer los valores. */
+    async list(prefix) {
+      const out = [];
+      let cursor;
+      do {
+        const page = await kv.list({ prefix, cursor });
+        for (const k of page.keys) out.push({ key: k.name, size: k.metadata?.size ?? 0 });
+        cursor = page.list_complete ? undefined : page.cursor;
+      } while (cursor);
+      return out;
+    },
   };
 }
 
+const MiB = 1024 * 1024;
+/** Un Worker no acepta peticiones de más de 100 MB: lo que pase de esto se sube por partes. */
+const SINGLE_PUT_MAX = 90 * MiB;
+/**
+ * Tamaño de cada parte de una subida grande. En R2, 50 MiB (pide 5 o más,
+ * todas iguales salvo la última). En KV, 20 MiB: cada trozo es un valor de
+ * KV, que no puede pasar de 25 MiB.
+ */
+const R2_PART_SIZE = 50 * MiB;
+const KV_PART_SIZE = 20 * MiB;
+const MULTIPART_TTL_S = 24 * 3600;
+
+/**
+ * Dónde se guardan los archivos subidos: en R2 (`BLOBS`, o `BUCKET` si todo
+ * va en R2) o, sin tarjeta, en Workers KV. Con `BLOBS` lo demás (eventos,
+ * rangos, packs…) se queda en KV, así que activarlo no pierde nada.
+ */
+const blobsOf = (env) => env.BLOBS ?? env.BUCKET;
+const blobsInKv = (env) => !env.BLOBS && Boolean(env.USING_KV);
+
+/** Un archivo subido: primero en R2 y, si no, en KV (los que se subieron antes de R2). */
+async function findFile(env, sha1, method = "head") {
+  const key = `files/${sha1}`;
+  return (env.BLOBS && (await env.BLOBS[method](key))) || (await env.BUCKET[method](key));
+}
+
 function limits(env) {
-  const mb = (v, d) => (Number(v) > 0 ? Number(v) : d) * 1024 * 1024;
-  const maxFile = mb(env.MAX_FILE_MB, env.USING_KV ? 25 : 50);
+  const mb = (v, d) => (Number(v) > 0 ? Number(v) : d) * MiB;
   return {
-    maxFile: env.USING_KV ? Math.min(maxFile, KV_MAX_VALUE) : maxFile,
+    maxFile: mb(env.MAX_FILE_MB, 2048),
+    // Lo que se sube de una vez; lo que pase va por partes.
+    singleMax: blobsInKv(env) ? KV_MAX_VALUE : SINGLE_PUT_MAX,
+    partSize: blobsInKv(env) ? KV_PART_SIZE : R2_PART_SIZE,
     dailyUpload: mb(env.DAILY_UPLOAD_MB, 1024),
     dailyPacks: Number(env.DAILY_PACKS) > 0 ? Number(env.DAILY_PACKS) : 30,
   };
@@ -217,10 +262,11 @@ async function route(request, env) {
 
   let m = path.match(/^\/files\/([0-9a-f]{40})$/);
   if (m && (method === "GET" || method === "HEAD")) {
-    const key = `files/${m[1]}`;
-    const obj = method === "HEAD" ? await env.BUCKET.head(key) : await env.BUCKET.get(key);
+    const obj = await findFile(env, m[1], method === "HEAD" ? "head" : "get");
     if (!obj) return new Response(null, { status: 404 });
-    return new Response(method === "HEAD" ? null : obj.body, {
+    const chunked = obj.customMetadata?.chunked;
+    const body = method === "HEAD" ? null : chunked ? chunkedBody(env, m[1], obj) : obj.body;
+    return new Response(body, {
       headers: {
         "content-type": "application/octet-stream",
         "x-content-type-options": "nosniff",
@@ -241,6 +287,11 @@ async function route(request, env) {
 
   m = path.match(/^\/api\/files\/([0-9a-f]{40})$/);
   if (m && method === "PUT") return uploadFile(request, env, m[1]);
+  m = path.match(/^\/api\/files\/([0-9a-f]{40})\/multipart(?:\/(complete|\d{1,5}))?$/);
+  if (m && !m[2] && method === "POST") return startMultipart(request, env, m[1]);
+  if (m && !m[2] && method === "DELETE") return abortMultipart(request, env, m[1]);
+  if (m && m[2] === "complete" && method === "POST") return completeMultipart(request, env, m[1]);
+  if (m && m[2] && m[2] !== "complete" && method === "PUT") return uploadPart(request, env, m[1], Number(m[2]));
 
   if (path === "/api/packs" && method === "POST") return createPack(request, env, url.origin);
 
@@ -394,32 +445,244 @@ const writeQuota = (env, q) => env.BUCKET.put(q.key, JSON.stringify(q.data));
 
 // ───────────────────────────── Archivos ─────────────────────────────
 
+const tooBig = (lim) => new HttpError(413, `el archivo pasa de ${Math.floor(lim.maxFile / MiB)} MB, el máximo permitido`);
+
+/** El cuerpo de la petición tal cual llega (R2 lo guarda sin pasar por la memoria del Worker). */
+const bodyOf = (request, size) =>
+  typeof FixedLengthStream === "function" ? request.body.pipeThrough(new FixedLengthStream(size)) : request.arrayBuffer();
+
 async function uploadFile(request, env, sha1) {
   const uuid = await requireAdmin(request, env);
   const lim = limits(env);
   const declared = Number(request.headers.get("content-length"));
   if (!(declared > 0)) throw new HttpError(411, "falta el tamaño del archivo");
-  if (declared > lim.maxFile) throw new HttpError(413, "el archivo supera el tamaño máximo permitido");
+  if (declared > lim.maxFile) throw tooBig(lim);
+  if (declared > lim.singleMax) {
+    throw new HttpError(413, "el archivo es demasiado grande para subirlo de una vez: súbelo por partes");
+  }
 
   const key = `files/${sha1}`;
-  if (await env.BUCKET.head(key)) return json({ url: `/files/${sha1}`, existed: true });
+  if (await findFile(env, sha1)) return json({ url: `/files/${sha1}`, existed: true });
 
   const quota = await readQuota(env, uuid);
   if (quota.data.bytes + declared > lim.dailyUpload) {
     throw new HttpError(429, "has alcanzado el límite de subida de hoy");
   }
 
-  const bytes = await request.arrayBuffer();
-  if (bytes.byteLength !== declared || bytes.byteLength > lim.maxFile) {
-    throw new HttpError(400, "el tamaño recibido no coincide");
+  if (blobsInKv(env)) {
+    const bytes = await request.arrayBuffer();
+    if (bytes.byteLength !== declared || bytes.byteLength > lim.maxFile) {
+      throw new HttpError(400, "el tamaño recibido no coincide");
+    }
+    const got = hex(await crypto.subtle.digest("SHA-1", bytes));
+    if (got !== sha1) throw new HttpError(400, "el SHA-1 del archivo no coincide");
+    await env.BUCKET.put(key, bytes, { customMetadata: { uploader: uuid } });
+  } else {
+    // R2 comprueba el SHA-1 mientras guarda: si no coincide, no guarda nada.
+    let obj;
+    try {
+      obj = await blobsOf(env).put(key, await bodyOf(request, declared), { sha1, customMetadata: { uploader: uuid } });
+    } catch {
+      throw new HttpError(400, "el SHA-1 o el tamaño del archivo no coinciden");
+    }
+    if (!obj || obj.size !== declared) {
+      await blobsOf(env).delete(key);
+      throw new HttpError(400, "el tamaño recibido no coincide");
+    }
   }
-  const got = hex(await crypto.subtle.digest("SHA-1", bytes));
-  if (got !== sha1) throw new HttpError(400, "el SHA-1 del archivo no coincide");
-
-  await env.BUCKET.put(key, bytes, { customMetadata: { uploader: uuid } });
-  quota.data.bytes += bytes.byteLength;
+  quota.data.bytes += declared;
   await writeQuota(env, quota);
   return json({ url: `/files/${sha1}`, existed: false }, 201);
+}
+
+// Archivos grandes: se suben por partes. Con R2, a una subida multiparte de R2
+// (partes de 50 MiB). Sin tarjeta, cada parte es un trozo de KV de 20 MiB
+// (`chunks/<sha1>/<id>/<n>`) y `files/<sha1>` es solo una marca que dice
+// cuántos trozos tiene; al descargar se mandan uno detrás de otro.
+// La subida en curso se apunta en `uploads/<sha1>` y caduca en un día.
+// El Worker no puede calcular el SHA-1 de cientos de MB en su tiempo de CPU,
+// pero el launcher lo comprueba al descargar y descarta el archivo si no coincide.
+
+const uploadKey = (sha1) => `uploads/${sha1}`;
+const chunkPrefix = (sha1, id) => `chunks/${sha1}/${id}/`;
+const partsOf = (rec) => Math.ceil(rec.size / rec.part_size);
+const partBytes = (rec, n) => (n < partsOf(rec) ? rec.part_size : rec.size - rec.part_size * (partsOf(rec) - 1));
+
+/** Los trozos de KV de un archivo, uno detrás de otro. */
+function chunkedBody(env, sha1, obj) {
+  const id = obj.customMetadata.chunked;
+  const parts = Number(obj.customMetadata.parts);
+  let n = 0;
+  const stream = new ReadableStream({
+    async pull(ctrl) {
+      n++;
+      const chunk = await env.BUCKET.get(`${chunkPrefix(sha1, id)}${n}`);
+      if (!chunk) return ctrl.error(new Error(`falta el trozo ${n} de ${sha1}`));
+      ctrl.enqueue(new Uint8Array(chunk.body));
+      if (n === parts) ctrl.close();
+    },
+  });
+  return typeof FixedLengthStream === "function" ? stream.pipeThrough(new FixedLengthStream(obj.size)) : stream;
+}
+
+async function readUpload(env, sha1, uuid) {
+  const obj = await env.BUCKET.get(uploadKey(sha1));
+  const rec = obj ? await obj.json() : null;
+  if (!rec || rec.uploader !== uuid || rec.expires < Date.now()) {
+    throw new HttpError(404, "no hay ninguna subida en curso de este archivo; vuelve a empezar");
+  }
+  return rec;
+}
+
+/** Tira lo que se subió de una subida que no se terminó. */
+async function dropUpload(env, sha1, rec) {
+  if (rec.kv) {
+    for (const k of await env.BUCKET.list(chunkPrefix(sha1, rec.upload_id))) await env.BUCKET.delete(k.key);
+  } else {
+    await blobsOf(env)
+      .resumeMultipartUpload(`files/${sha1}`, rec.upload_id)
+      .abort()
+      .catch(() => {});
+  }
+}
+
+/** KV no tira solo los trozos de subidas abandonadas: se limpian al empezar otra. */
+async function dropStaleUploads(env) {
+  const stale = (await env.BUCKET.list("uploads/")).slice(0, 10);
+  for (const { key } of stale) {
+    const obj = await env.BUCKET.get(key);
+    const rec = obj ? await obj.json().catch(() => null) : null;
+    if (rec && rec.expires >= Date.now()) continue;
+    if (rec) await dropUpload(env, key.slice("uploads/".length), rec);
+    await env.BUCKET.delete(key);
+  }
+}
+
+async function startMultipart(request, env, sha1) {
+  const uuid = await requireAdmin(request, env);
+  const body = await readSmallJson(request, 1024);
+  const size = Number(body?.size);
+  if (!Number.isSafeInteger(size) || size <= 0) throw new HttpError(400, "tamaño inválido");
+  const lim = limits(env);
+  if (size > lim.maxFile) throw tooBig(lim);
+
+  const existing = await findFile(env, sha1);
+  if (existing && existing.size === size) return json({ url: `/files/${sha1}`, existed: true });
+  // Cabe de una vez: mejor así, porque entonces se comprueba el SHA-1 aquí.
+  if (size <= lim.singleMax) return json({ existed: false, single: true });
+
+  const quota = await readQuota(env, uuid);
+  if (quota.data.bytes + size > lim.dailyUpload) throw new HttpError(429, "has alcanzado el límite de subida de hoy");
+
+  const kv = blobsInKv(env);
+  if (kv) await dropStaleUploads(env);
+  const prev = await env.BUCKET.get(uploadKey(sha1));
+  if (prev) await dropUpload(env, sha1, await prev.json());
+
+  const uploadId = kv
+    ? hex(crypto.getRandomValues(new Uint8Array(8)))
+    : (await blobsOf(env).createMultipartUpload(`files/${sha1}`, { customMetadata: { uploader: uuid } })).uploadId;
+  const rec = {
+    upload_id: uploadId,
+    kv,
+    size,
+    part_size: lim.partSize,
+    uploader: uuid,
+    expires: Date.now() + MULTIPART_TTL_S * 1000,
+  };
+  // En KV sin caducidad: si caducara, nadie sabría qué trozos borrar.
+  await env.BUCKET.put(uploadKey(sha1), JSON.stringify(rec), kv ? {} : { expirationTtl: MULTIPART_TTL_S });
+  // Se cuenta al empezar: así no se esquiva la cuota cancelando y repitiendo.
+  quota.data.bytes += size;
+  await writeQuota(env, quota);
+  return json({ existed: false, part_size: rec.part_size, parts: partsOf(rec) }, 201);
+}
+
+async function uploadPart(request, env, sha1, n) {
+  const uuid = await requireAdmin(request, env);
+  const rec = await readUpload(env, sha1, uuid);
+  const parts = partsOf(rec);
+  if (!(n >= 1 && n <= parts)) throw new HttpError(400, `la parte debe ser de la 1 a la ${parts}`);
+  const expected = partBytes(rec, n);
+  if (Number(request.headers.get("content-length")) !== expected) {
+    throw new HttpError(400, `la parte ${n} debe medir ${expected} bytes`);
+  }
+  if (rec.kv) {
+    const bytes = await request.arrayBuffer();
+    if (bytes.byteLength !== expected) throw new HttpError(400, `la parte ${n} debe medir ${expected} bytes`);
+    try {
+      await env.BUCKET.put(`${chunkPrefix(sha1, rec.upload_id)}${n}`, bytes);
+    } catch {
+      throw new HttpError(507, `no se pudo guardar la parte ${n}: puede que el almacenamiento (1 GB gratis) esté lleno`);
+    }
+    return json({ part_number: n, etag: `kv-${n}` });
+  }
+  let part;
+  try {
+    part = await blobsOf(env)
+      .resumeMultipartUpload(`files/${sha1}`, rec.upload_id)
+      .uploadPart(n, await bodyOf(request, expected));
+  } catch {
+    throw new HttpError(400, `no se pudo guardar la parte ${n}; vuelve a intentarlo`);
+  }
+  return json({ part_number: part.partNumber, etag: part.etag });
+}
+
+async function completeMultipart(request, env, sha1) {
+  const uuid = await requireAdmin(request, env);
+  const rec = await readUpload(env, sha1, uuid);
+  const body = await readSmallJson(request, 64 * 1024);
+  const total = partsOf(rec);
+  const list = Array.isArray(body?.parts) ? body.parts : [];
+  const ok =
+    list.length === total &&
+    list.every((p, i) => p && p.part_number === i + 1 && typeof p.etag === "string" && p.etag.length <= 200);
+  if (!ok) throw new HttpError(400, `faltan partes: hacen falta las ${total}, en orden`);
+
+  const key = `files/${sha1}`;
+  if (rec.kv) {
+    const prefix = chunkPrefix(sha1, rec.upload_id);
+    const got = new Map((await env.BUCKET.list(prefix)).map((k) => [k.key.slice(prefix.length), k.size]));
+    for (let n = 1; n <= total; n++) {
+      if (got.get(String(n)) !== partBytes(rec, n)) {
+        throw new HttpError(400, `la parte ${n} no llegó bien; vuelve a subirla`);
+      }
+    }
+    const old = await env.BUCKET.head(key);
+    await env.BUCKET.put(key, JSON.stringify({ chunked: rec.upload_id, parts: total }), {
+      size: rec.size,
+      customMetadata: { uploader: uuid, chunked: rec.upload_id, parts: String(total) },
+    });
+    const oldId = old?.customMetadata?.chunked;
+    if (oldId && oldId !== rec.upload_id) {
+      for (const k of await env.BUCKET.list(chunkPrefix(sha1, oldId))) await env.BUCKET.delete(k.key);
+    }
+    await env.BUCKET.delete(uploadKey(sha1));
+    return json({ url: `/files/${sha1}`, existed: false }, 201);
+  }
+
+  let obj;
+  try {
+    obj = await blobsOf(env)
+      .resumeMultipartUpload(key, rec.upload_id)
+      .complete(list.map((p) => ({ partNumber: p.part_number, etag: p.etag })));
+  } catch {
+    throw new HttpError(400, "alguna parte no llegó bien; vuelve a subir el archivo");
+  }
+  await env.BUCKET.delete(uploadKey(sha1));
+  if (!obj || obj.size !== rec.size) {
+    await blobsOf(env).delete(key);
+    throw new HttpError(400, "el tamaño recibido no coincide");
+  }
+  return json({ url: `/files/${sha1}`, existed: false }, 201);
+}
+
+async function abortMultipart(request, env, sha1) {
+  const uuid = await requireAdmin(request, env);
+  const rec = await readUpload(env, sha1, uuid);
+  await dropUpload(env, sha1, rec);
+  await env.BUCKET.delete(uploadKey(sha1));
+  return new Response(null, { status: 204 });
 }
 
 // ───────────────────────────── Packs ─────────────────────────────
@@ -446,7 +709,7 @@ async function checkFileUrl(env, origin, rawUrl, sha1, size) {
   if (u.protocol !== "https:") return false;
   if (u.hostname === MODRINTH_CDN) return true;
   if (u.origin !== origin || u.pathname !== `/files/${sha1}` || u.search) return false;
-  const obj = await env.BUCKET.head(`files/${sha1}`);
+  const obj = await findFile(env, sha1);
   return obj !== null && (size === undefined || obj.size === size);
 }
 

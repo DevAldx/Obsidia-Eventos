@@ -99,6 +99,10 @@ Cada cuenta tiene **un rango para todos los eventos**. Se da desde el panel web
 | `POST /api/admin/events/<EVT-…>/players` | admin | añadir `{ players: [{ uuid, name }] }` |
 | `DELETE /api/admin/events/<EVT-…>/players/<uuid>` | admin | quitar de la whitelist |
 | `PUT /api/files/<sha1>`, `POST /api/packs`, `DELETE /api/packs/<código>` | admin | subir y borrar packs (desde Obsidia normal) |
+| `POST /api/files/<sha1>/multipart` | Developer+ | `{ size }` empieza a subir un archivo grande (`single: true` si cabe de una vez) |
+| `PUT /api/files/<sha1>/multipart/<n>` | Developer+ | la parte `n` (`part_size` bytes; la última, el resto) |
+| `POST /api/files/<sha1>/multipart/complete` | Developer+ | `{ parts: [{ part_number, etag }] }` |
+| `DELETE /api/files/<sha1>/multipart` | Developer+ | cancela la subida |
 | `GET /files/<sha1>` | cualquiera con el hash | un archivo de un pack |
 | `GET /admin` | navegador | panel web de administración |
 | `POST /api/admin/web-login` | navegador | `{ password }` → sesión web de admin |
@@ -122,6 +126,29 @@ Cada cuenta tiene **un rango para todos los eventos**. Se da desde el panel web
 - **Eventos cerrados** (`active: false`): los jugadores no los ven; los admins sí.
 - Todo vive en un índice (`events/index.json`). Dos admins guardando
   exactamente a la vez podrían pisarse; vuelve a cargar si ves algo raro.
+
+## Archivos grandes
+
+Antes de subir un mod, búscalo en Modrinth desde el panel (Cobblemon está
+ahí): esos se descargan de Modrinth y no ocupan nada aquí.
+
+Lo que subes tú se guarda así:
+
+- **Sin tarjeta (KV):** hasta 25 MB, de una vez, y el servidor comprueba su
+  SHA-1. Lo que pase se sube en partes de 20 MB y cada parte queda como un
+  trozo de KV; al descargar se mandan uno detrás de otro. **El KV gratis tiene
+  1 GB en total**, así que caben dos o tres mods de 300 MB. Los trozos de una
+  subida que no se termina se borran al empezar la siguiente (pasado un día).
+- **Con R2 (más espacio):** activa R2 en el panel de Cloudflare (pide tarjeta;
+  10 GB gratis), `npx wrangler r2 bucket create obsidia-eventos-files`,
+  descomenta el bloque `BLOBS` de `wrangler.toml` y despliega. Solo los
+  archivos nuevos van a R2; lo demás y los archivos viejos siguen en KV. Hasta
+  90 MB se suben de una vez (R2 comprueba el SHA-1); lo que pase, en partes de
+  50 MB.
+
+El SHA-1 de lo que se sube por partes no lo puede calcular el Worker (no le da
+el tiempo de CPU): lo comprueba el launcher al descargar. El máximo por
+archivo es `MAX_FILE_MB`.
 
 ## Proteger el servidor de Minecraft
 
@@ -149,5 +176,5 @@ historiales.
 ## Pruebas
 
 ```bash
-npm test        # con R2 y con KV, sin red
+npm test        # con R2, con KV y con KV + R2 (BLOBS), sin red
 ```

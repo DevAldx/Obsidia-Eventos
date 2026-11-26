@@ -12,6 +12,7 @@ const SERVER_KEY = "k".repeat(32);
 
 function memoryBucket() {
   const store = new Map();
+  const uploads = new Map();
   const obj = (v) => ({
     size: v.bytes.byteLength,
     customMetadata: v.customMetadata,
@@ -28,10 +29,53 @@ function memoryBucket() {
     },
     async put(k, value, opts = {}) {
       const bytes = typeof value === "string" ? new TextEncoder().encode(value) : new Uint8Array(value);
+      // Como R2: con `sha1` comprueba el contenido y, si no coincide, falla sin guardar.
+      if (opts.sha1 && createHash("sha1").update(bytes).digest("hex") !== opts.sha1) throw new Error("BadDigest");
       store.set(k, { bytes, customMetadata: opts.customMetadata });
+      return obj(store.get(k));
     },
     async delete(k) {
       store.delete(k);
+    },
+    // Subidas multiparte como las de R2 (las partes se guardan aparte hasta completar).
+    uploads,
+    async createMultipartUpload(k, opts = {}) {
+      const uploadId = `up-${uploads.size + 1}`;
+      uploads.set(uploadId, { key: k, parts: new Map(), customMetadata: opts.customMetadata });
+      return this.resumeMultipartUpload(k, uploadId);
+    },
+    resumeMultipartUpload(k, uploadId) {
+      const get = () => {
+        const u = uploads.get(uploadId);
+        if (!u || u.key !== k) throw new Error("NoSuchUpload");
+        return u;
+      };
+      return {
+        uploadId,
+        async uploadPart(n, value) {
+          const bytes = new Uint8Array(value);
+          get().parts.set(n, { bytes, etag: `etag-${n}-${bytes.byteLength}` });
+          return { partNumber: n, etag: `etag-${n}-${bytes.byteLength}` };
+        },
+        async complete(list) {
+          const u = get();
+          const chunks = list.map((p) => {
+            const part = u.parts.get(p.partNumber);
+            if (!part || part.etag !== p.etag) throw new Error("InvalidPart");
+            return part.bytes;
+          });
+          const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
+          let at = 0;
+          for (const c of chunks) bytes.set(c, (at += c.byteLength) - c.byteLength);
+          store.set(k, { bytes, customMetadata: u.customMetadata });
+          uploads.delete(uploadId);
+          return obj(store.get(k));
+        },
+        async abort() {
+          get();
+          uploads.delete(uploadId);
+        },
+      };
     },
   };
 }
@@ -48,14 +92,24 @@ function memoryKv() {
     async put(k, value, opts = {}) {
       store.set(k, { value: new Uint8Array(value), metadata: structuredClone(opts.metadata ?? null) });
     },
+    // Como KV: páginas de 2 claves para probar el cursor.
+    async list({ prefix = "", cursor } = {}) {
+      const names = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const from = Number(cursor ?? 0);
+      const keys = names.slice(from, from + 2).map((name) => ({ name, metadata: store.get(name).metadata }));
+      const done = from + 2 >= names.length;
+      return { keys, list_complete: done, ...(done ? {} : { cursor: String(from + 2) }) };
+    },
     async delete(k) {
       store.delete(k);
     },
   };
 }
 
-// `STORAGE=kv node --test test/` prueba el modo sin tarjeta (Workers KV).
-const USE_KV = process.env.STORAGE === "kv";
+// `STORAGE=kv node --test test/` prueba el modo sin tarjeta (Workers KV);
+// `STORAGE=kv+r2` el de KV con los archivos en R2 (BLOBS).
+const USE_KV = process.env.STORAGE === "kv" || process.env.STORAGE === "kv+r2";
+const USE_BLOBS = process.env.STORAGE === "kv+r2";
 
 function makeEnv() {
   const base = {
@@ -65,8 +119,11 @@ function makeEnv() {
     ADMIN_UUIDS: UUID,
     SERVER_KEY: SERVER_KEY,
   };
+  if (USE_BLOBS) return { ...base, FILES: memoryKv(), BLOBS: memoryBucket() };
   return USE_KV ? { ...base, FILES: memoryKv() } : { ...base, BUCKET: memoryBucket() };
 }
+/** ¿Los archivos van a R2 (y se pueden subir por partes)? */
+const BLOBS_IN_R2 = !USE_KV || USE_BLOBS;
 
 // El Worker no debe llamar a ninguna red: todo se verifica con firmas.
 globalThis.fetch = async (url) => {
@@ -221,6 +278,134 @@ test("rechaza hashes falsos, archivos grandes y URLs ajenas", async () => {
   const traversal = manifest("https://cdn.modrinth.com/x.jar", hash, 3);
   traversal.mods[0].file_name = "../../evil.jar";
   assert.equal((await post(env, "/api/packs", token, traversal)).status, 400);
+});
+
+test("archivos grandes: se suben por partes (R2 o trozos de KV)", async () => {
+  const env = { ...makeEnv(), MAX_FILE_MB: "2048" };
+  const admin = await tokenOf(env);
+  const player = await tokenOf(env, PLAYER);
+  const MiB = 1024 * 1024;
+  const big = new Uint8Array(100 * MiB);
+  for (let i = 0; i < big.length; i += 4096) big[i] = (i / 4096) % 251;
+  const hash = sha1(big);
+  const base = `/api/files/${hash}/multipart`;
+
+  const fits = await post(env, `/api/files/${sha1(big.slice(0, 10 * MiB))}/multipart`, admin, { size: 10 * MiB });
+  assert.deepEqual(await fits.json(), { existed: false, single: true }, "lo que cabe va de una vez");
+
+  assert.equal((await post(env, base, player, { size: big.byteLength })).status, 403, "un jugador no sube");
+  assert.equal((await post(env, base, admin, { size: 3 * 1024 * MiB })).status, 413, "más de MAX_FILE_MB");
+  const tooBigAtOnce = await call(env, "PUT", `/api/files/${hash}`, {
+    body: big,
+    token: admin,
+    headers: { "content-length": String(big.byteLength + 40 * MiB) },
+  });
+  assert.equal(tooBigAtOnce.status, 413, "de una vez no pasa de 90 MB");
+
+  const start = await post(env, base, admin, { size: big.byteLength });
+  assert.equal(start.status, 201);
+  const up = await start.json();
+  assert.equal(up.part_size, BLOBS_IN_R2 ? 50 * MiB : 20 * MiB);
+  assert.equal(up.parts, BLOBS_IN_R2 ? 2 : 5);
+
+  const putPart = (n, bytes, token = admin) =>
+    call(env, "PUT", `${base}/${n}`, { body: bytes, token, headers: { "content-length": String(bytes.byteLength) } });
+  assert.equal((await putPart(1, big.slice(0, MiB))).status, 400, "una parte del tamaño equivocado");
+  assert.equal((await putPart(3, big.slice(0, MiB))).status, 400, "una parte que no existe");
+  const other = await tokenOf(env, "11111111111111111111111111111111");
+  await call(env, "PUT", `/api/admin/members/11111111111111111111111111111111`, {
+    token: admin,
+    body: JSON.stringify({ name: "Dev", rank: "developer" }),
+  });
+  assert.equal((await putPart(1, big.slice(0, up.part_size), other)).status, 404, "otra cuenta no sigue mi subida");
+
+  const parts = [];
+  for (let n = 1; n <= up.parts; n++) {
+    const r = await putPart(n, big.slice((n - 1) * up.part_size, n * up.part_size));
+    assert.equal(r.status, 200, `parte ${n}`);
+    parts.push(await r.json());
+  }
+  assert.equal((await post(env, `${base}/complete`, admin, { parts: parts.slice(0, 1) })).status, 400, "faltan partes");
+  const done = await post(env, `${base}/complete`, admin, { parts });
+  assert.equal(done.status, 201);
+  assert.equal((await done.json()).url, `/files/${hash}`);
+
+  const file = await call(env, "GET", `/files/${hash}`);
+  assert.equal(file.status, 200);
+  assert.equal(sha1(new Uint8Array(await file.arrayBuffer())), hash, "se descarga entero");
+  assert.equal((await (await post(env, base, admin, { size: big.byteLength })).json()).existed, true, "dedupe");
+  assert.equal((await post(env, "/api/packs", admin, manifest(`${ORIGIN}/files/${hash}`, hash, big.byteLength))).status, 201);
+
+  const head = await call(env, "HEAD", `/files/${hash}`);
+  assert.equal(head.headers.get("content-length"), String(big.byteLength), "HEAD dice el tamaño entero");
+
+  // Cancelar una subida a medias: no deja trozos.
+  const other2 = new Uint8Array(95 * MiB);
+  other2[0] = 7;
+  const sbase = `/api/files/${sha1(other2)}/multipart`;
+  const s = await (await post(env, sbase, admin, { size: other2.byteLength })).json();
+  const sput = await call(env, "PUT", `${sbase}/1`, {
+    body: other2.slice(0, s.part_size),
+    token: admin,
+    headers: { "content-length": String(s.part_size) },
+  });
+  assert.equal(sput.status, 200);
+  assert.equal((await call(env, "DELETE", sbase, { token: admin })).status, 204);
+  assert.equal((await call(env, "PUT", `${sbase}/1`, { body: other2.slice(0, 50 * MiB), token: admin })).status, 404);
+  if (!BLOBS_IN_R2) {
+    const left = [...env.FILES.store.keys()].filter((k) => k.startsWith(`chunks/${sha1(other2)}/`));
+    assert.deepEqual(left, [], "cancelar borra los trozos");
+  }
+});
+
+test("KV: los trozos de subidas abandonadas se borran al empezar otra", async () => {
+  if (BLOBS_IN_R2) return;
+  const env = { ...makeEnv(), MAX_FILE_MB: "2048" };
+  const admin = await tokenOf(env);
+  const MiB = 1024 * 1024;
+  const a = new Uint8Array(30 * MiB);
+  a[1] = 1;
+  const b = new Uint8Array(30 * MiB);
+  b[2] = 2;
+  const abase = `/api/files/${sha1(a)}/multipart`;
+  const up = await (await post(env, abase, admin, { size: a.byteLength })).json();
+  const r = await call(env, "PUT", `${abase}/1`, {
+    body: a.slice(0, up.part_size),
+    token: admin,
+    headers: { "content-length": String(up.part_size) },
+  });
+  assert.equal(r.status, 200);
+  const chunksOfA = () => [...env.FILES.store.keys()].filter((k) => k.startsWith(`chunks/${sha1(a)}/`));
+  assert.equal(chunksOfA().length, 1);
+
+  // Pasa un día sin terminarla.
+  const recKey = `uploads/${sha1(a)}`;
+  const rec = JSON.parse(new TextDecoder().decode(env.FILES.store.get(recKey).value));
+  rec.expires = Date.now() - 1;
+  await env.FILES.put(recKey, new TextEncoder().encode(JSON.stringify(rec)), { metadata: env.FILES.store.get(recKey).metadata });
+
+  assert.equal((await post(env, `/api/files/${sha1(b)}/multipart`, admin, { size: b.byteLength })).status, 201);
+  assert.deepEqual(chunksOfA(), [], "los trozos abandonados se borran");
+  assert.ok(!env.FILES.store.has(recKey));
+});
+
+test("con R2 el SHA-1 lo comprueba R2 y los archivos viejos de KV siguen", async () => {
+  if (!USE_BLOBS) return;
+  const env = makeEnv();
+  const token = await tokenOf(env);
+  const old = new TextEncoder().encode("un mod subido cuando todo estaba en KV");
+  await env.FILES.put(`files/${sha1(old)}`, old, { metadata: { size: old.byteLength, custom: {} } });
+  const file = await call(env, "GET", `/files/${sha1(old)}`);
+  assert.equal(new TextDecoder().decode(await file.arrayBuffer()), "un mod subido cuando todo estaba en KV");
+  assert.equal((await upload(env, token, old)).status, 200, "ya existía en KV");
+
+  const jar = new TextEncoder().encode("mod nuevo");
+  assert.equal((await upload(env, token, jar)).status, 201);
+  assert.ok(env.BLOBS.store.has(`files/${sha1(jar)}`), "lo nuevo va a R2");
+  assert.ok(!env.FILES.store.has(`files/${sha1(jar)}`));
+  const bad = await call(env, "PUT", `/api/files/${"1".repeat(40)}`, { body: jar, token, headers: { "content-length": "9" } });
+  assert.equal(bad.status, 400);
+  assert.ok(!env.BLOBS.store.has(`files/${"1".repeat(40)}`));
 });
 
 test("sin almacenamiento configurado responde un error claro", async () => {

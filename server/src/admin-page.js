@@ -64,6 +64,11 @@ export const ADMIN_HTML = `<!doctype html>
   .wide { grid-column: 1 / -1; }
   label.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; }
   label.field .hint { font-weight: 400; display: inline; }
+  .image-field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; font-weight: 600; }
+  .image-field .hint { font-weight: 400; }
+  .image-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .image-row input { flex: 1 1 220px; min-width: 0; }
+  #image-preview { width: 72px; height: 40px; object-fit: cover; border-radius: 7px; border: 1px solid var(--border); flex: none; }
   label.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
   label.check input { width: auto; }
   .actions { display: flex; gap: 10px; margin-top: 16px; }
@@ -196,7 +201,16 @@ export const ADMIN_HTML = `<!doctype html>
               <datalist id="fabric-versions"></datalist>
             </label>
             <label class="field">Memoria máxima (MB) <input name="memory_max" type="number" min="1024" step="512" value="4096"></label>
-            <label class="field wide">Imagen <span class="hint">(https, opcional)</span><input name="image_url" class="mono" placeholder="https://…/portada.jpg"></label>
+            <div class="image-field wide">
+              <label for="image-url">Imagen de fondo <span class="hint">(PNG, JPG, WEBP o GIF de hasta 15 MB; opcional)</span></label>
+              <div class="image-row">
+                <img id="image-preview" alt="" hidden>
+                <input id="image-url" name="image_url" class="mono" placeholder="Sube una foto o pega una URL https://…">
+                <button class="btn sm" type="button" id="image-upload-btn">Subir foto</button>
+                <button class="btn sm" type="button" id="image-clear" hidden>Quitar</button>
+                <input type="file" id="image-input" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+              </div>
+            </div>
             <label class="check wide"><input type="checkbox" name="active" checked> Abierto: los jugadores de la whitelist lo ven y pueden jugar</label>
           </div>
           <section class="mods" id="mods-section">
@@ -528,6 +542,7 @@ function renderEditor() {
   form.loader_version.value = ev ? ev.loader_version || "" : "";
   form.memory_max.value = ev && ev.memory ? ev.memory.max_mb : ev ? "" : "4096";
   form.image_url.value = ev ? ev.image_url || "" : "";
+  showImage();
   form.active.checked = ev ? ev.active : true;
   mods = [];
   pack = null;
@@ -755,6 +770,109 @@ $("update-mods").addEventListener("click", async () => {
   else toast("Mods actualizados a " + mc, "ok");
 });
 
+/** Hasta aquí se sube siempre de una vez; lo que pase, el servidor dice si de una vez o por partes. */
+const SINGLE_UPLOAD_MAX = 20 * 1048576;
+
+async function putFile(path, body) {
+  let last;
+  for (let tries = 0; tries < 3; tries++) {
+    const res = await fetch(path, { method: "PUT", headers: { authorization: "Bearer " + token }, body });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) return data;
+    last = new Error(data.error || "Error " + res.status);
+    if (res.status < 500 && res.status !== 429) break;
+  }
+  throw last;
+}
+
+/** Sube un .jar (de una vez o por partes) y devuelve su SHA-1. */
+async function uploadJar(file, btn) {
+  const label = "Subiendo " + file.name + "…";
+  btn.textContent = label;
+  const buf = await file.arrayBuffer();
+  const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  if (file.size <= SINGLE_UPLOAD_MAX) {
+    await putFile("/api/files/" + sha1, buf);
+    return sha1;
+  }
+  const base = "/api/files/" + sha1 + "/multipart";
+  const up = await api("POST", base, { size: file.size });
+  if (up.existed) return sha1;
+  if (up.single) {
+    await putFile("/api/files/" + sha1, buf);
+    return sha1;
+  }
+  try {
+    const parts = [];
+    for (let n = 1; n <= up.parts; n++) {
+      btn.textContent = label + " " + Math.floor(((n - 1) / up.parts) * 100) + " %";
+      const part = await putFile(base + "/" + n, buf.slice((n - 1) * up.part_size, n * up.part_size));
+      parts.push({ part_number: n, etag: part.etag });
+    }
+    btn.textContent = label + " 100 %";
+    await api("POST", base + "/complete", { parts });
+  } catch (err) {
+    api("DELETE", base).catch(() => {});
+    throw err;
+  }
+  return sha1;
+}
+
+// ── Imagen de fondo: se sube como cualquier archivo y el evento apunta a /files/<sha1>.
+// El launcher la descarga si pesa hasta 15 MB y es PNG, JPG, WEBP o GIF.
+const IMAGE_MAX = 15 * 1048576;
+
+function isImage(b) {
+  const starts = (sig) => sig.every((v, i) => b[i] === v);
+  return (
+    starts([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) ||
+    starts([0xff, 0xd8, 0xff]) ||
+    starts([0x47, 0x49, 0x46, 0x38]) ||
+    (starts([0x52, 0x49, 0x46, 0x46]) && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50)
+  );
+}
+
+function showImage() {
+  const url = form.image_url.value.trim();
+  const img = $("image-preview");
+  $("image-clear").hidden = !url;
+  if (!/^https:\\/\\/|^\\/files\\//.test(url) && !url.startsWith(location.origin + "/files/")) {
+    img.hidden = true;
+    img.removeAttribute("src");
+    return;
+  }
+  img.hidden = false;
+  if (img.getAttribute("src") !== url) img.src = url;
+}
+
+$("image-preview").addEventListener("error", () => { $("image-preview").hidden = true; });
+form.image_url.addEventListener("input", showImage);
+$("image-clear").addEventListener("click", () => { form.image_url.value = ""; showImage(); markDirty(); });
+$("image-upload-btn").addEventListener("click", () => $("image-input").click());
+$("image-input").addEventListener("change", async (e) => {
+  const file = e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  const btn = $("image-upload-btn");
+  btn.disabled = true;
+  btn.textContent = "Subiendo…";
+  try {
+    if (file.size > IMAGE_MAX) throw new Error("pesa más de 15 MB y el launcher no la descargaría");
+    const buf = await file.arrayBuffer();
+    if (!isImage(new Uint8Array(buf.slice(0, 12)))) throw new Error("tiene que ser PNG, JPG, WEBP o GIF");
+    const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
+    await putFile("/api/files/" + sha1, buf);
+    form.image_url.value = location.origin + "/files/" + sha1;
+    showImage();
+    markDirty();
+    toast("Foto subida. Guarda el evento para usarla.", "ok");
+  } catch (err) {
+    toast(file.name + ": " + err.message, "err");
+  }
+  btn.disabled = false;
+  btn.textContent = "Subir foto";
+});
+
 $("upload-btn").addEventListener("click", () => $("upload-input").click());
 $("upload-input").addEventListener("change", async (e) => {
   const files = [...e.target.files];
@@ -762,14 +880,9 @@ $("upload-input").addEventListener("change", async (e) => {
   const btn = $("upload-btn");
   btn.disabled = true;
   for (const file of files) {
-    btn.textContent = "Subiendo " + file.name + "…";
     try {
       if (!file.name.toLowerCase().endsWith(".jar")) throw new Error("solo archivos .jar");
-      if (file.size > 25 * 1048576) throw new Error("pesa más de 25 MB");
-      const buf = await file.arrayBuffer();
-      const sha1 = [...new Uint8Array(await crypto.subtle.digest("SHA-1", buf))].map((b) => b.toString(16).padStart(2, "0")).join("");
-      const res = await fetch("/api/files/" + sha1, { method: "PUT", headers: { authorization: "Bearer " + token }, body: buf });
-      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Error " + res.status);
+      const sha1 = await uploadJar(file, btn);
       const name = file.name.replace(/[\\\\/]/g, "_");
       mods = mods.filter((m) => m.file_name !== name);
       mods.push({ file_name: name, url: location.origin + "/files/" + sha1, sha1, size: file.size, title: name.replace(/\\.jar$/i, "") });

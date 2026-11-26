@@ -10,14 +10,18 @@ compatibility_date = "2025-10-01"
 binding = "FILES"
 id = "07e896586a8f4a6ea49ade0a6736d18d"
 
-# Opción B (pide tarjeta aunque sea gratis): R2. Si la activas, tiene prioridad.
+# Sin tarjeta, los archivos de más de 25 MB se guardan en KV en trozos de 20 MB.
+# Ojo: el KV gratis tiene 1 GB en total para todo.
+# Con más espacio: R2 solo para los archivos subidos (10 GB gratis, pide tarjeta).
+# Los eventos, rangos y packs se quedan en KV, así que activarlo no pierde nada.
+# Créalo con `npx wrangler r2 bucket create obsidia-eventos-files` y descomenta esto:
 # [[r2_buckets]]
-# binding = "BUCKET"
-# bucket_name = "obsidia-eventos"
+# binding = "BLOBS"
+# bucket_name = "obsidia-eventos-files"
 
 [vars]
-# Tamaño máximo de un archivo subido (MB). Con KV nunca pasa de 25.
-MAX_FILE_MB = "25"
+# Tamaño máximo de un archivo subido (MB). Lo grande se sube por partes.
+MAX_FILE_MB = "1024"
 # Lo que puede subir cada admin al día (MB) y cuántos packs.
 DAILY_UPLOAD_MB = "2000"
 DAILY_PACKS = "50"
